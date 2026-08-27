@@ -10,7 +10,7 @@ __pycache__/
 htmlcov/
 
 # Data & model artifacts (regenerate via `make dataset train eval`)
-data/
+data/*.parquet
 models/
 reports/
 
