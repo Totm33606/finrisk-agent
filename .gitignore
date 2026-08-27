@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Data & model artifacts (regenerate via `make dataset train eval`)
+data/
+models/
+reports/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+.env.local
+uv.lock
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
