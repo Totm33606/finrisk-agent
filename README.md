@@ -18,6 +18,8 @@ checkable, not a black box.
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-261230)](https://docs.astral.sh/ruff/)
 [![Type checked: mypy --strict](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org/)
 
+https://github.com/user-attachments/assets/0191bc9e-62a0-4fcd-98ea-251818ce8eef
+
 ---
 
 ## Table of contents
