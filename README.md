@@ -8,6 +8,7 @@ agent that explains the score in plain language, answers "what if"
 questions, and justifies its recommendation — with every step logged and
 checkable, not a black box.
 
+[![CI](https://github.com/Totm33606/finrisk-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Totm33606/finrisk-agent/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Managed with uv](https://img.shields.io/badge/managed%20with-uv-de4c36)](https://docs.astral.sh/uv/)
@@ -24,8 +25,8 @@ https://github.com/user-attachments/assets/0191bc9e-62a0-4fcd-98ea-251818ce8eef
 
 ## Table of contents
 
-- [Glossary](#glossary)
 - [Why this project](#why-this-project)
+- [Glossary](#glossary)
 - [Architecture](#architecture)
 - [Repository structure](#repository-structure)
 - [Quickstart](#quickstart)
@@ -39,10 +40,28 @@ https://github.com/user-attachments/assets/0191bc9e-62a0-4fcd-98ea-251818ce8eef
 - [Evaluation](#evaluation)
 - [Testing & quality gates](#testing--quality-gates)
 - [Technical choices & trade-offs](#technical-choices--trade-offs)
-- [Roadmap](#roadmap)
 - [License](#license)
 
 ---
+
+## Why this project
+
+Most "LLM + ML" demos stop at a notebook, or wrap a model in a chatbot with
+no real structure underneath. This one is built closer to how an actual
+credit-decisioning tool would be:
+
+- **The prediction itself never touches an LLM.** A classic, well-tested ML
+  model (LightGBM) does the actual risk assessment — the AI only reads and
+  explains its output, never invents a number.
+- **The model and the agent are cleanly separated** (via MCP, see
+  [Glossary](#glossary)) — you can swap out the AI agent, or retrain and
+  redeploy the model, without touching the other side.
+- **Every step the agent takes is logged and reviewable.** You can see
+  exactly which questions it asked the model, in what order, and why it
+  reached its conclusion — not a black box.
+- **The dashboard shows the model's real output, not the AI's guess.** The
+  charts are built from the same data the agent received, not a second,
+  potentially-inconsistent call.
 
 ## Glossary
 
@@ -87,25 +106,6 @@ already familiar with them.
 - **Langfuse**: a dashboard that records everything the agent did — which
   tools it called, with what inputs/outputs, and how long each step took —
   so a human can review any past run afterwards.
-
-## Why this project
-
-Most "LLM + ML" demos stop at a notebook, or wrap a model in a chatbot with
-no real structure underneath. This one is built closer to how an actual
-credit-decisioning tool would be:
-
-- **The prediction itself never touches an LLM.** A classic, well-tested ML
-  model (LightGBM) does the actual risk assessment — the AI only reads and
-  explains its output, never invents a number.
-- **The model and the agent are cleanly separated** (via MCP, see
-  [Glossary](#glossary)) — you can swap out the AI agent, or retrain and
-  redeploy the model, without touching the other side.
-- **Every step the agent takes is logged and reviewable.** You can see
-  exactly which questions it asked the model, in what order, and why it
-  reached its conclusion — not a black box.
-- **The dashboard shows the model's real output, not the AI's guess.** The
-  charts are built from the same data the agent received, not a second,
-  potentially-inconsistent call.
 
 ## Architecture
 
@@ -494,17 +494,6 @@ Each major dependency was picked over a real alternative, not by default:
   the scoring server over HTTP. Simpler and more contained for a tool
   that's spawned locally by the agent; an HTTP option
   (`streamable-http`) is available for remote or multi-consumer setups.
-
-## Roadmap
-
-- [ ] Show how long each individual tool call took, not just the total
-      run time (technical: via LangChain's `astream_events`)
-- [ ] Stream the agent's reasoning to the dashboard live, piece by piece,
-      instead of only showing it once the full answer is ready
-- [ ] Split training/test data by date instead of randomly, once
-      real dated data is available — more realistic for a live system
-- [ ] Replace the flat-file client lookup with a real feature store
-      (e.g. Feast), for an actual production deployment
 
 ## License
 
