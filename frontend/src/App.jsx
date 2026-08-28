@@ -179,7 +179,9 @@ function DecisionBadge({ decision }) {
   const meta = DECISION_META[decision] ?? DECISION_META.REVIEW;
   const Icon = meta.icon;
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 ${meta.tone}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 animate-stamp-in ${meta.tone}`}
+    >
       <Icon className="w-3.5 h-3.5" strokeWidth={2} />
       <span className="font-mono text-[11px] uppercase tracking-wider font-medium">
         {meta.label}

@@ -15,6 +15,7 @@ but much slower perturbation approach.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import matplotlib
@@ -27,6 +28,15 @@ import shap
 from common.schemas import ShapContribution, ShapExplanation
 
 logger = logging.getLogger(__name__)
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_filename_component(value: str) -> str:
+    """Strip anything but alphanumerics/`_`/`-`, so a value can't escape `out_dir` via
+    path separators or `..` segments when interpolated into a filename (defense in
+    depth — callers are also expected to only pass already-validated client ids)."""
+    return _UNSAFE_FILENAME_CHARS.sub("_", value)
 
 
 class CreditRiskExplainer:
@@ -104,7 +114,7 @@ class CreditRiskExplainer:
 
         fig = plt.figure(figsize=(9, 6))
         shap.plots.waterfall(explanation[0], show=False, max_display=12)
-        out_path = out_dir / f"waterfall_{client_id}.png"
+        out_path = out_dir / f"waterfall_{_safe_filename_component(client_id)}.png"
         fig.tight_layout()
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)

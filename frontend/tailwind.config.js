@@ -45,9 +45,15 @@ export default {
           "0%": { opacity: "0", transform: "translateY(4px)" },
           "100%": { opacity: "1", transform: "translateY(0)" },
         },
+        "stamp-in": {
+          "0%": { opacity: "0", transform: "scale(1.6) rotate(-10deg)" },
+          "60%": { opacity: "1", transform: "scale(0.94) rotate(2deg)" },
+          "100%": { opacity: "1", transform: "scale(1) rotate(0deg)" },
+        },
       },
       animation: {
         "print-in": "print-in 220ms ease-out",
+        "stamp-in": "stamp-in 320ms cubic-bezier(0.2, 0, 0.2, 1)",
       },
     },
   },

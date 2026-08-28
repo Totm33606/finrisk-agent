@@ -326,8 +326,13 @@ async def analyze(payload: AnalyzeRequest) -> AgentAnalysisResult:
     try:
         return await runtime.analyze(payload.client_id, payload.question)
     except Exception as exc:
+        # Full detail goes to the server log only — the client gets a generic
+        # message so internal error text (file paths, provider error bodies,
+        # MCP connection details, ...) never leaks to an unauthenticated caller.
         logger.exception("Agent run failed for client_id=%s", payload.client_id)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502, detail="Agent run failed — see server logs for details."
+        ) from exc
 
 
 @api.get("/health")
