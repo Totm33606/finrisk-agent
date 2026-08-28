@@ -151,14 +151,6 @@ def test_client_store_raises_when_data_file_missing(tmp_path: Path) -> None:
         ClientStore(data_path=tmp_path / "does_not_exist.parquet", id_column="client_id")
 
 
-def test_client_store_get_features_returns_client_features(tmp_cfg: MLConfig) -> None:
-    store = ClientStore(data_path=tmp_cfg.raw_data_path, id_column=tmp_cfg.id_column)
-
-    features = store.get_features("SME-000001")
-
-    assert features.client_id == "SME-000001"
-
-
 def test_to_score_result_recommendation_bands(scoring_service: ScoringService) -> None:
     threshold = scoring_service._cfg.decision_threshold
 

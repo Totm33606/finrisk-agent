@@ -40,7 +40,6 @@ export default function ShapChart({ explanation, loading }) {
     .map((c) => ({
       feature: c.feature.replace(/_/g, " "),
       value: c.shap_value,
-      raw: c.value,
     }))
     .reverse();
 

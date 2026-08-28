@@ -22,7 +22,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import shap
 
 from common.schemas import ShapContribution, ShapExplanation
@@ -131,13 +130,3 @@ class CreditRiskExplainer:
         plt.close(fig)
         logger.info("Global SHAP summary plot written to %s", out_path)
         return out_path
-
-
-def build_raw_value_map(row: pd.Series, feature_names: list[str]) -> dict[str, float]:
-    """Best-effort map from transformed feature name back to a display value.
-
-    One-hot encoded columns (e.g. `sector_retail`) won't have a 1:1 raw
-    counterpart, so those fall back to the transformed (0/1) value inside
-    `CreditRiskExplainer.explain_row`; numeric columns map directly.
-    """
-    return {name: float(row[name]) for name in feature_names if name in row.index}

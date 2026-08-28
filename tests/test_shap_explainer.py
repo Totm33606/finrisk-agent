@@ -6,14 +6,13 @@ from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
-import pandas as pd
 import pytest
 from sklearn.linear_model import LogisticRegression
 
 from ml_pipeline.config import MLConfig
 from ml_pipeline.make_dataset import _simulate
 from ml_pipeline.preprocessing import build_preprocessor, get_feature_names
-from ml_pipeline.shap_explainer import CreditRiskExplainer, build_raw_value_map
+from ml_pipeline.shap_explainer import CreditRiskExplainer
 
 
 @pytest.fixture
@@ -96,14 +95,6 @@ def test_render_summary_writes_png(tmp_path: Path) -> None:
 
     assert out_path.exists()
     assert out_path.name == "shap_summary.png"
-
-
-def test_build_raw_value_map_keeps_only_known_columns() -> None:
-    row = pd.Series({"annual_revenue": 100_000.0, "total_debt": 5_000.0, "sector": "retail"})
-
-    result = build_raw_value_map(row, feature_names=["annual_revenue", "total_debt", "missing"])
-
-    assert result == {"annual_revenue": 100_000.0, "total_debt": 5_000.0}
 
 
 def test_logistic_regression_model_requires_background_data() -> None:

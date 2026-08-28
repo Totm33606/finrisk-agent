@@ -19,7 +19,6 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 
 from common.schemas import (
-    ClientFeatures,
     CreditScoreResult,
     RiskBand,
     ScenarioParams,
@@ -116,11 +115,6 @@ class ClientStore:
             f"Expected a single row for client_id={client_id!r}, found duplicates in the index."
         )
         return row
-
-    def get_features(self, client_id: str) -> ClientFeatures:
-        row = self.get_row(client_id)
-        raw = row.drop(labels=["defaulted_12m"], errors="ignore").to_dict()
-        return ClientFeatures(**{str(k): v for k, v in raw.items()})
 
 
 class ScoringService:

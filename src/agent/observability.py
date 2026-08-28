@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -89,20 +87,6 @@ def build_callback_handler(
         tags=["finrisk-agent", "credit-decisioning"],
         metadata={"client_id": client_id, "question": question},
     )
-
-
-@contextmanager
-def traced_tool_span(handler: CallbackHandler | None, tool_name: str) -> Iterator[None]:
-    """No-op context manager placeholder for tool-level spans outside the LLM call graph.
-
-    LangGraph's tool-calling loop is already captured by `build_callback_handler`
-    via LangChain's callback system (each ToolNode invocation becomes a Langfuse
-    span automatically). This helper exists for the rare case of instrumenting
-    logic that runs *outside* that graph (e.g. a manual pre/post-processing step)
-    while keeping a single, consistent tracing entrypoint for the module.
-    """
-    del tool_name  # captured automatically by the LangChain callback handler
-    yield
 
 
 def flush() -> None:
