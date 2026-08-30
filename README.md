@@ -336,6 +336,19 @@ Plus a `finrisk://model/card` **resource** exposing the model's version,
 training details, and latest accuracy metrics — background info the agent
 can read once per session instead of asking for it repeatedly.
 
+**Which clients can be scored, and why it matters.** The tools above only
+serve clients from the **held-out test split** (`models/holdout_test.parquet`,
+written by `make train`) — not the full synthetic dataset. This is
+deliberate: the full dataset includes the rows the model was actually
+trained on, and if the live demo could score those, most client_ids you'd
+try would return memorized rather than genuinely out-of-sample predictions
+— quietly making the demo look more accurate than the model really is. The
+[Evaluation](#evaluation) numbers were always computed on this same
+held-out split; this just makes sure the *live* demo has that same honesty
+property.
+
+
+
 ## Agent & observability
 
 ```bash

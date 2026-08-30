@@ -8,6 +8,7 @@ the *actual* persisted production artifact.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import joblib
@@ -23,10 +24,11 @@ from mcp_server.scoring_service import (
     ScoringService,
     load_model_bundle,
 )
-from ml_pipeline.config import MLConfig
+from ml_pipeline.config import MLConfig, config
 from ml_pipeline.make_dataset import _simulate
 from ml_pipeline.preprocessing import build_preprocessor, get_feature_names
 from ml_pipeline.shap_explainer import CreditRiskExplainer
+from ml_pipeline.train import _split
 
 
 @pytest.fixture
@@ -179,3 +181,41 @@ def test_simulate_scenario_debt_and_utilization_overrides_move_pd(
     scenario = scoring_service.simulate_financial_scenario("SME-000005", params)
 
     assert scenario.simulated.probability_default != scenario.baseline.probability_default
+
+
+def test_client_store_default_data_path_is_holdout_test_not_raw_data() -> None:
+    """ClientStore's default must point at the held-out split, not the full training
+    corpus, so a live server never serves clients the deployed model was trained on."""
+    default = inspect.signature(ClientStore.__init__).parameters["data_path"].default
+
+    assert default == config.holdout_test_path
+    assert default != config.raw_data_path
+
+
+def test_client_store_only_serves_holdout_clients_not_training_clients(
+    tmp_path: Path,
+) -> None:
+    """Reproduces the actual fix end-to-end: a client_id that was part of the training
+    fold must be unreachable through the store that backs the live MCP tools, while a
+    held-out client_id works normally."""
+    cfg = MLConfig(
+        data_dir=tmp_path,
+        raw_data_path=tmp_path / "clients.parquet",
+        model_dir=tmp_path / "models",
+        shap_plots_dir=tmp_path / "reports" / "shap",
+    )
+    cfg.model_dir.mkdir(parents=True, exist_ok=True)
+    df = _simulate(n_clients=300, seed=cfg.random_state)
+    df.to_parquet(cfg.raw_data_path, index=False)
+
+    train_df, test_df = _split(cfg, df)
+    test_df.to_parquet(cfg.holdout_test_path, index=False)
+
+    store = ClientStore(data_path=cfg.holdout_test_path, id_column=cfg.id_column)
+
+    train_only_id = next(iter(set(train_df["client_id"]) - set(test_df["client_id"])))
+    with pytest.raises(ClientNotFoundError):
+        store.get_row(train_only_id)
+
+    holdout_id = str(test_df["client_id"].iloc[0])
+    assert store.get_row(holdout_id)["client_id"] == holdout_id

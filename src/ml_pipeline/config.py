@@ -29,13 +29,15 @@ class MLConfig(BaseSettings):
     model_path: Path = PROJECT_ROOT / "models" / "lgbm_credit_risk.joblib"
     preprocessor_path: Path = PROJECT_ROOT / "models" / "preprocessor.joblib"
     metrics_path: Path = PROJECT_ROOT / "models" / "metrics.json"
+    holdout_test_path: Path = PROJECT_ROOT / "models" / "holdout_test.parquet"
     shap_plots_dir: Path = PROJECT_ROOT / "reports" / "shap"
 
     @model_validator(mode="before")
     @classmethod
     def _derive_dependent_paths(cls, data: Any) -> Any:
-        """Make `raw_data_path`/`model_path`/`preprocessor_path`/`metrics_path` follow an
-        overridden `data_dir`/`model_dir` unless explicitly overridden themselves.
+        """Make `raw_data_path`/`model_path`/`preprocessor_path`/`metrics_path`/
+        `holdout_test_path` follow an overridden `data_dir`/`model_dir` unless
+        explicitly overridden themselves.
 
         Without this, e.g. `MLConfig(model_dir=tmp_path)` silently leaves `model_path`
         pointing at the real `PROJECT_ROOT/models/...` — every caller that overrides only
@@ -54,6 +56,8 @@ class MLConfig(BaseSettings):
                 data["preprocessor_path"] = Path(model_dir) / "preprocessor.joblib"
             if "metrics_path" not in data:
                 data["metrics_path"] = Path(model_dir) / "metrics.json"
+            if "holdout_test_path" not in data:
+                data["holdout_test_path"] = Path(model_dir) / "holdout_test.parquet"
         return data
 
     # --- Target / split ------------------------------------------------

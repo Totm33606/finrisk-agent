@@ -52,7 +52,7 @@ def _load_artifacts(
         )
     model = joblib.load(cfg.model_path)
     preprocessor = joblib.load(cfg.preprocessor_path)
-    test_df = pd.read_parquet(cfg.model_dir / "holdout_test.parquet")
+    test_df = pd.read_parquet(cfg.holdout_test_path)
     return model, preprocessor, test_df
 
 

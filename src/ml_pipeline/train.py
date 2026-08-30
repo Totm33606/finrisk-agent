@@ -176,7 +176,7 @@ def run(
 
     joblib.dump(model, cfg.model_path)
     joblib.dump(preprocessor, cfg.preprocessor_path)
-    test_df.to_parquet(cfg.model_dir / "holdout_test.parquet", index=False)
+    test_df.to_parquet(cfg.holdout_test_path, index=False)
 
     if cfg.model_type != "lightgbm":
         # shap.LinearExplainer needs a background sample to estimate the

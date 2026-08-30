@@ -7,11 +7,13 @@ import { DECISION_META } from "./lib/decisionMeta.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 
-// Synthetic dataset, so any client_id up to whatever `--n-clients` was
-// generated with exists — these three are always in range (default is
-// 20,000) and let a first-time visitor try the demo without reading the
-// README to find a valid id.
-const EXAMPLE_CLIENTS = ["SME-000001", "SME-000042", "SME-001337"];
+// The MCP server only serves clients from the held-out test split (see
+// ClientStore in scoring_service.py) — not the full synthetic dataset — so
+// these three are verified present in models/holdout_test.parquet from an
+// actual `make train` run, not just guessed to be "somewhere in range".
+// Re-verify against a fresh holdout_test.parquet if you regenerate the
+// dataset with a different --n-clients/seed.
+const EXAMPLE_CLIENTS = ["SME-000001", "SME-000007", "SME-000009"];
 const EXAMPLE_QUESTIONS = [
   "Should we approve this client's credit request?",
   "What if their revenue dropped 20%?",

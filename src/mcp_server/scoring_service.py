@@ -92,17 +92,23 @@ def load_model_bundle(cfg: MLConfig = config) -> ModelBundle:
 class ClientStore:
     """Read-only lookup of client feature rows, keyed by `client_id`.
 
-    Backed by the same parquet file used for training in this showcase
-    repo; in production this would be a call to a data warehouse / feature
-    store (e.g. a Feast online store) instead of a flat file.
+    Backed by the held-out test split (`holdout_test_path`), not the full
+    training corpus — every client scoreable at runtime is therefore one the
+    currently-deployed model never trained on. Loading the full
+    `raw_data_path` instead would mean ~80% of demo-able client_ids were
+    memorized during training, quietly making the live demo look more
+    accurate than genuine out-of-sample performance. In production this
+    would be a call to a data warehouse / feature store (e.g. a Feast online
+    store) instead of a flat file.
     """
 
     def __init__(
-        self, data_path: Path = config.raw_data_path, id_column: str = config.id_column
+        self, data_path: Path = config.holdout_test_path, id_column: str = config.id_column
     ) -> None:
         if not data_path.exists():
             raise FileNotFoundError(
-                f"No client dataset at {data_path}. Run `python -m ml_pipeline.make_dataset`."
+                f"No held-out client dataset at {data_path}. Run `python -m ml_pipeline.train` "
+                "first — it writes this file alongside the model artifacts."
             )
         self._df = pd.read_parquet(data_path).set_index(id_column, drop=False)
         self._id_column = id_column
