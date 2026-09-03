@@ -7,7 +7,7 @@ downstream (the LangChain agent, and — indirectly — the React dashboard).
 
 Tools:
     get_credit_score(client_id)                         -> CreditScoreResult
-    get_shap_explanation(client_id, render_plot)         -> ShapExplanation
+    get_shap_explanation(client_id)                      -> ShapExplanation
     simulate_financial_scenario(client_id, params)       -> ScenarioResult
 
 Resources:
@@ -16,8 +16,8 @@ Resources:
 Transport:
     Defaults to stdio (the standard choice for a locally-spawned tool
     server consumed by a LangChain/LangGraph agent subprocess). Run with
-    `--transport streamable-http` to expose it over HTTP for the dashboard
-    or remote agents instead.
+    `--transport streamable-http` to expose it over HTTP instead, which is
+    how the Docker stack reaches it from the agent container.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="finrisk-agent",
     instructions=(
-        "Tools for scoring SME/client credit risk with a LightGBM model, "
+        "Tools for scoring SME/client credit risk with a trained ML model, "
         "explaining individual predictions via SHAP, and running what-if "
         "financial scenarios. Always call get_credit_score before "
         "get_shap_explanation for the same client in a single turn, and "
@@ -93,9 +93,6 @@ def get_credit_score(
 @mcp.tool()
 def get_shap_explanation(
     client_id: Annotated[str, Field(description="Client/SME identifier, e.g. 'SME-000123'")],
-    render_plot: Annotated[
-        bool, Field(description="Whether to also render a waterfall PNG to disk")
-    ] = True,
 ) -> ShapExplanation:
     """Return the SHAP feature-attribution explanation behind a client's score.
 
@@ -106,7 +103,7 @@ def get_shap_explanation(
     evidence) that the contributions sum away from.
     """
     try:
-        explanation = _get_service().get_shap_explanation(client_id, render_plot=render_plot)
+        explanation = _get_service().get_shap_explanation(client_id)
         logger.info(
             "get_shap_explanation(%s) -> top_positive=%s top_negative=%s",
             client_id,
@@ -158,18 +155,18 @@ def simulate_financial_scenario(
 
 @mcp.resource("finrisk://model/card")
 def model_card() -> str:
-    """Model card resource: version, features, and metrics for the currently loaded model.
+    """Model card resource: version, features, and metrics for the currently served model.
 
     Exposed as a Resource (not a Tool) since it is static, cacheable
     context about the model itself rather than an action performed against
     a specific client — the right MCP primitive for "background reading"
     material the agent can pull into context once per session.
+
+    Everything here comes from the MLflow run behind the resolved registry
+    alias, so the card always describes the same model version the three
+    tools above are scoring with.
     """
-    metadata_path = config.model_dir / "metadata.json"
-    metrics_path = config.metrics_path
-    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-    metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else {}
-    return json.dumps({"metadata": metadata, "metrics": metrics}, indent=2)
+    return json.dumps(_get_service().get_model_card(), indent=2, default=str)
 
 
 cli = typer.Typer(add_completion=False)
@@ -183,8 +180,20 @@ def main(
     ] = "stdio",
     host: Annotated[str, typer.Option(help="Host, for http/sse transports")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="Port, for http/sse transports")] = 8000,
+    alias: Annotated[
+        str,
+        typer.Option(
+            help="Registry alias to serve (default: the configured one, `champion`). "
+            "e.g. --alias challenger, to inspect a candidate before promoting it."
+        ),
+    ] = "",
 ) -> None:
     """Entry point: `finrisk-mcp --transport streamable-http --port 8000`."""
+    if alias:
+        # Which version is served is fixed for the server's lifetime, so it
+        # has no business in the tool signatures an agent sees — set once
+        # here instead; `_get_service()` reads it lazily on first tool call.
+        config.mlflow_model_alias = alias
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:

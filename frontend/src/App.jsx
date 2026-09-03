@@ -7,13 +7,13 @@ import { DECISION_META } from "./lib/decisionMeta.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 
-// The MCP server only serves clients from the held-out test split (see
-// ClientStore in scoring_service.py) — not the full synthetic dataset — so
-// these three are verified present in models/holdout_test.parquet from an
-// actual `make train` run, not just guessed to be "somewhere in range".
-// Re-verify against a fresh holdout_test.parquet if you regenerate the
-// dataset with a different --n-clients/seed.
-const EXAMPLE_CLIENTS = ["SME-000001", "SME-000007", "SME-000009"];
+// The MCP server only serves clients from the held-out test split logged in
+// the served model's own MLflow run (see ClientStore in scoring_service.py) —
+// not the full synthetic dataset. Which ids land in that split depends on
+// --n-clients, so these three were picked from the intersection of the
+// holdouts at 2 000 (CI), 20 000 (`make dataset` default) and 25 000 (the
+// README's evaluation run). Re-verify if you change --n-clients or the seed.
+const EXAMPLE_CLIENTS = ["SME-000182", "SME-000220", "SME-000324"];
 const EXAMPLE_QUESTIONS = [
   "Should we approve this client's credit request?",
   "What if their revenue dropped 20%?",
@@ -21,7 +21,7 @@ const EXAMPLE_QUESTIONS = [
 ];
 
 export default function App() {
-  const [clientId, setClientId] = useState("SME-000123");
+  const [clientId, setClientId] = useState(EXAMPLE_CLIENTS[0]);
   const [question, setQuestion] = useState("Should we approve this client's credit request?");
   const [result, setResult] = useState(null);
   const [isRunning, setIsRunning] = useState(false);

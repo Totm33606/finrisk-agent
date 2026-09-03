@@ -1,0 +1,9 @@
+# Dockerfile.frontend does `npm ci` and then `COPY . .`. Without this file that
+# second COPY drops the *host* node_modules on top of the one the container just
+# installed — and vite/rollup/esbuild ship platform-specific native binaries, so
+# a Windows or macOS tree lands in a linux/amd64 image. Ignoring it also keeps
+# the build context small.
+node_modules
+
+# Stale host build output; `npm run build` regenerates it inside the image.
+dist

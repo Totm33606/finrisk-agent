@@ -67,32 +67,6 @@ def test_explain_row_drivers_are_disjoint_and_correctly_signed(
     assert all(by_feature[f] < 0 for f in explanation.top_negative_drivers)
 
 
-def test_render_waterfall_writes_png(
-    tmp_path: Path, explainer_and_row: tuple[CreditRiskExplainer, np.ndarray]
-) -> None:
-    explainer, row = explainer_and_row
-
-    out_path = explainer.render_waterfall(row, client_id="SME-000004", out_dir=tmp_path)
-
-    assert out_path.exists()
-    assert out_path.name == "waterfall_SME-000004.png"
-
-
-def test_render_waterfall_sanitizes_path_traversal_in_client_id(
-    tmp_path: Path, explainer_and_row: tuple[CreditRiskExplainer, np.ndarray]
-) -> None:
-    """A client_id containing path separators/`..` must not escape out_dir."""
-    explainer, row = explainer_and_row
-    out_dir = tmp_path / "reports"
-
-    out_path = explainer.render_waterfall(row, client_id="../../../../tmp/pwned", out_dir=out_dir)
-
-    assert out_path.parent == out_dir
-    assert out_path.exists()
-    assert ".." not in out_path.name
-    assert "/" not in out_path.name and "\\" not in out_path.name
-
-
 def test_render_summary_writes_png(tmp_path: Path) -> None:
     cfg = MLConfig()
     df = _simulate(n_clients=150, seed=cfg.random_state)

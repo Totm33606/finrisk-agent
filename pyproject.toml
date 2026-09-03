@@ -30,6 +30,15 @@ dependencies = [
     "joblib>=1.4.2",
     "optuna>=4.0.0",
     "typer>=0.13.0",
+    # Pinned to 2.x: `ml_pipeline.tracking` targets the 2.x model-logging
+    # signature (`log_model(model, artifact_path=...)`), which MLflow 3
+    # reworked. Note this constrains pandas to <3 transitively.
+    "mlflow>=2.17,<3.0.0",
+    # langchain-mcp-adapters puts no upper bound on mcp itself, but only
+    # supports its 1.x client API — mcp 2.0 renamed streamablehttp_client to
+    # streamable_http_client and breaks agent.py's import. Pinned directly
+    # since nothing else constrains it.
+    "mcp<2.0",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +54,10 @@ dev = [
 [project.scripts]
 finrisk-train = "ml_pipeline.train:app"
 finrisk-eval = "ml_pipeline.eval:app"
-finrisk-mcp = "mcp_server.server:main"
+# `:cli`, not `:main` — typer's @command decorator returns the plain function,
+# so a console script pointing at `main` would run with hardcoded defaults and
+# silently ignore --transport/--host/--port/--alias.
+finrisk-mcp = "mcp_server.server:cli"
 finrisk-agent = "agent.agent:main"
 
 [tool.ruff]

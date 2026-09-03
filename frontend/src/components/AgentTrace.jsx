@@ -58,9 +58,6 @@ function TraceLine({ step }) {
         ) : (
           <XCircle className="w-3 h-3 text-signal-critical" />
         )}
-        <span className="ml-auto">
-          {step.latency_ms > 0 ? `${step.latency_ms.toFixed(0)}ms` : ""}
-        </span>
       </div>
       <p className="font-mono text-[12px] text-paper-300 mt-1 break-words">
         {formatArgs(step.tool_input)}

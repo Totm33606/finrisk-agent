@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import optuna
@@ -15,16 +16,29 @@ from ml_pipeline.train import _cv_average_precision, _optuna_search, _split
 
 
 @pytest.fixture
-def small_cfg() -> MLConfig:
+def small_cfg(tmp_path: Path) -> MLConfig:
     # Explicit model_type: these tests assert LightGBM-shaped behavior
     # (n_estimators, num_leaves, ...) and must not depend on whatever
     # MLConfig.model_type's global default currently is.
-    return MLConfig(model_type="lightgbm", n_cv_folds=2, optuna_n_trials=2)
+    # `mlflow_dir` under tmp_path: these call `_optuna_search` directly, with
+    # no active run, so nothing should be written — but if that ever regressed,
+    # it must not land in the developer's real store.
+    return MLConfig(
+        model_type="lightgbm",
+        n_cv_folds=2,
+        optuna_n_trials=2,
+        mlflow_dir=tmp_path / "mlruns",
+    )
 
 
 @pytest.fixture
-def small_logreg_cfg() -> MLConfig:
-    return MLConfig(model_type="logistic_regression", n_cv_folds=2, optuna_n_trials=2)
+def small_logreg_cfg(tmp_path: Path) -> MLConfig:
+    return MLConfig(
+        model_type="logistic_regression",
+        n_cv_folds=2,
+        optuna_n_trials=2,
+        mlflow_dir=tmp_path / "mlruns",
+    )
 
 
 @pytest.fixture

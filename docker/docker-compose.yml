@@ -1,29 +1,138 @@
 services:
+  # One-off jobs, not long-running servers: `docker compose run --rm train`
+  # (see `make docker-train` / `make docker-eval`). Excluded from `up` by the
+  # "tools" profile.
+  #
+  # Why these exist instead of just training on the host: MLflow's local file
+  # store bakes the absolute path in effect at experiment-creation time into
+  # each run's artifact location. Train on the host and that path is the
+  # Windows/Linux host path; `mcp` resolves runs from `/app/mlruns` inside the
+  # container, so it would look for artifacts under a path that doesn't exist
+  # there. Training here keeps every writer of `mlruns/` on the same
+  # `/app/mlruns` view that `mcp` reads from.
+  #
+  # `entrypoint:`, not `command:`, on these two: anything typed after the
+  # service name in `docker compose run` *replaces* a `command:` but is
+  # *appended* to an `entrypoint:`. So this shape is what makes
+  # `docker compose run --rm train --alias challenger` mean what it looks
+  # like — with a `command:` it would try to exec `--alias` as a binary.
+  # (It also drops the image's own CMD, which is the agent API — wanted here.)
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: finrisk-agent:latest
+    profiles: ["tools"]
+    entrypoint: [python, -m, ml_pipeline.train]
+    volumes:
+      - ../mlruns:/app/mlruns
+      - ../data:/app/data:ro
+
+  eval:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: finrisk-agent:latest
+    profiles: ["tools"]
+    entrypoint: [python, -m, ml_pipeline.eval]
+    volumes:
+      - ../mlruns:/app/mlruns
+
+  # The scoring server, as its own deployable. Splitting it out of the agent
+  # process is the point of putting MCP at the seam: the model side can be
+  # restarted, scaled or pointed at another registry alias without touching
+  # the agent, and only this container ever sees the model store.
+  mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: finrisk-agent:latest
+    container_name: finrisk-mcp
+    command:
+      - python
+      - -m
+      - mcp_server.server
+      - --transport
+      - streamable-http
+      # 0.0.0.0 so the agent container can reach it; the port is not published
+      # to the host, so it stays reachable only from the compose network.
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    volumes:
+      # Read-only: this container only ever serves what `train`/`eval` wrote.
+      # Must already be populated (`make docker-train`) — there is no
+      # local-artifact fallback to boot from.
+      - ../mlruns:/app/mlruns:ro
+    environment:
+      # No FINRISK_MLFLOW_TRACKING_URI here: MLConfig derives it from
+      # mlflow_dir (PROJECT_ROOT/mlruns), and PROJECT_ROOT resolves to /app
+      # inside this image — same file:///app/mlruns the volume above mounts.
+      # The alias below picks which registered model version gets served.
+      - FINRISK_MLFLOW_MODEL_ALIAS=${FINRISK_MLFLOW_MODEL_ALIAS:-champion}
+    healthcheck:
+      # A TCP connect, not an HTTP request: FastMCP serves only the MCP
+      # protocol on /mcp, with no health route to call. This proves the
+      # listener is up — the agent's own handshake proves the rest.
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; socket.create_connection(("127.0.0.1", 8000), 3).close()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Browses the same mlruns/ store, from inside the same container filesystem
+  # context mcp/train/eval use — unlike `make mlflow-ui` on the host, which
+  # can list runs (plain text meta.yaml) but 500s on opening an artifact
+  # trained via Docker, since file:///app/mlruns/... doesn't exist there.
+  mlflow-ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: finrisk-agent:latest
+    container_name: finrisk-mlflow-ui
+    command: [mlflow, ui, --backend-store-uri, file:///app/mlruns, --host, 0.0.0.0, --port, "5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../mlruns:/app/mlruns:ro
+    # The image's own HEALTHCHECK probes the agent API on :8080 (its default
+    # CMD). This service serves MLflow on :5000, so inheriting it would just
+    # report a permanently unhealthy container.
+    healthcheck:
+      disable: true
+
   agent-api:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.backend
     image: finrisk-agent:latest
     container_name: finrisk-agent-api
     ports:
       - "8080:8080"
-    volumes:
-      - ../models:/app/models:ro
-      - ../data:/app/data:ro
-      - ../reports:/app/reports
+    depends_on:
+      mcp:
+        condition: service_healthy
+    # Makes host.docker.internal resolve on Linux Docker Engine too (Docker
+    # Desktop already provides it for free on Mac/Windows) — needed for
+    # LOCAL_LLM_BASE_URL below to reach an Ollama/LM Studio running on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
-      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
-      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      - FINRISK_MCP_URL=${FINRISK_MCP_URL:-http://mcp:8000/mcp}
+      # host.docker.internal, not localhost: this is the container's own
+      # network namespace, so `localhost` would mean the container itself.
+      # Wires the local-Ollama/LM Studio path only — using Azure OpenAI,
+      # plain OpenAI or Langfuse through this stack means adding the
+      # corresponding vars here too (kept out for now, see .env.example).
+      - LOCAL_LLM_BASE_URL=${LOCAL_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+    # No healthcheck block: this service runs the image's default CMD, so the
+    # image's own HEALTHCHECK (same probe) already applies and `dashboard`'s
+    # `service_healthy` below waits on it.
 
   dashboard:
     build:
@@ -33,8 +142,11 @@ services:
     container_name: finrisk-dashboard
     ports:
       - "5173:80"
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8080
+    # No VITE_* env here: Vite inlines import.meta.env at build time, and this
+    # image ships a prebuilt bundle served by nginx, so a runtime variable
+    # would be silently ignored. The bundle's own fallback
+    # (http://localhost:8080) is already the published agent-api port; to point
+    # it elsewhere, pass --build-arg/ARG through Dockerfile.frontend instead.
     depends_on:
       agent-api:
         condition: service_healthy

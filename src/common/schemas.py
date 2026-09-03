@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RiskBand(str, Enum):
@@ -80,11 +80,6 @@ class CreditScoreResult(BaseModel):
     decision_threshold: float = Field(..., description="Operating threshold used for accept/reject")
     recommendation: Literal["APPROVE", "REVIEW", "DECLINE"]
 
-    @field_validator("recommendation", mode="before")
-    @classmethod
-    def _derive_recommendation_if_missing(cls, v: str | None) -> str:
-        return v or "REVIEW"
-
 
 class ShapContribution(BaseModel):
     """A single feature's SHAP contribution to one prediction."""
@@ -95,7 +90,7 @@ class ShapContribution(BaseModel):
 
 
 class ShapExplanation(BaseModel):
-    """Local (per-client) SHAP explanation, ready for waterfall rendering."""
+    """Local (per-client) SHAP explanation, ready for the dashboard's attribution chart."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -104,9 +99,6 @@ class ShapExplanation(BaseModel):
     contributions: list[ShapContribution]
     top_positive_drivers: list[str] = Field(..., description="Features pushing risk up, sorted")
     top_negative_drivers: list[str] = Field(..., description="Features pushing risk down, sorted")
-    plot_path: str | None = Field(
-        None, description="Path to a rendered waterfall PNG, if generated"
-    )
 
 
 class ScenarioParams(BaseModel):
@@ -151,7 +143,6 @@ class AgentStep(BaseModel):
         None,
         description="Full parsed tool payload (e.g. CreditScoreResult as dict), for UI rendering",
     )
-    latency_ms: float
     status: Literal["success", "error"] = "success"
 
 

@@ -21,22 +21,16 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: |
-          uv venv --python 3.11
-          uv pip install -e ".[dev]"
+        run: uv sync --locked --extra dev
 
       - name: Lint (ruff)
         run: uv run ruff check src tests
 
       - name: Type check (mypy)
-        run: uv run mypy src
+        run: uv run mypy src tests
 
-      - name: Generate synthetic dataset (needed for scoring-service tests)
-        run: uv run python -m ml_pipeline.make_dataset --n-clients 2000
-        working-directory: .
-        env:
-          PYTHONPATH: src
-
+      # No dataset generation step: every fixture builds its own tiny dataset
+      # (and its own MLflow store) under tmp_path, so the suite is hermetic.
       - name: Run tests with coverage
         run: uv run pytest
         env:

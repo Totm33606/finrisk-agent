@@ -45,6 +45,11 @@ class ObservabilityConfig:
 _obs_config = ObservabilityConfig()
 _langfuse_client: Langfuse | None = None
 
+if not _obs_config.enabled:
+    # Once, at import — not on every call below, which would put one warning
+    # line per analyst request into the API log.
+    logger.warning("Langfuse credentials not set — running without tracing.")
+
 
 def get_langfuse_client() -> Langfuse | None:
     """Return a process-wide Langfuse client, or None if credentials are absent.
@@ -55,7 +60,6 @@ def get_langfuse_client() -> Langfuse | None:
     """
     global _langfuse_client
     if not _obs_config.enabled:
-        logger.warning("Langfuse credentials not set — running without tracing.")
         return None
     if _langfuse_client is None:
         _langfuse_client = Langfuse(

@@ -1,21 +1,20 @@
 """SHAP-based local & global explainability for the credit-risk model.
 
 Two consumers:
-    1. `eval.py` / notebooks — global summary plots for model documentation.
+    1. `eval.py` — the global summary plot, logged into the model's MLflow run.
     2. `mcp_server.server` — per-client structured contributions, consumed
-       by the agent's `get_shap_explanation` tool and rendered by the React
-       waterfall component.
+       by the agent's `get_shap_explanation` tool and drawn by the React
+       attribution chart.
 
-`shap.TreeExplainer` is used because it is exact (not sampling-based) and
-fast for tree ensembles like LightGBM, computing SHAP values via the
-recursive tree-traversal algorithm rather than Kernel SHAP's model-agnostic
-but much slower perturbation approach.
+`shap.TreeExplainer` is preferred for the default LightGBM model because it
+is exact (not sampling-based) and fast for tree ensembles, computing SHAP
+values via the recursive tree-traversal algorithm rather than Kernel SHAP's
+model-agnostic but much slower perturbation approach.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 
 import matplotlib
@@ -28,15 +27,6 @@ import shap
 from common.schemas import ShapContribution, ShapExplanation
 
 logger = logging.getLogger(__name__)
-
-_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_-]")
-
-
-def _safe_filename_component(value: str) -> str:
-    """Strip anything but alphanumerics/`_`/`-`, so a value can't escape `out_dir` via
-    path separators or `..` segments when interpolated into a filename (defense in
-    depth — callers are also expected to only pass already-validated client ids)."""
-    return _UNSAFE_FILENAME_CHARS.sub("_", value)
 
 
 class CreditRiskExplainer:
@@ -103,23 +93,7 @@ class CreditRiskExplainer:
             contributions=contributions,
             top_positive_drivers=top_positive,
             top_negative_drivers=top_negative,
-            plot_path=None,
         )
-
-    def render_waterfall(self, x_row: np.ndarray, client_id: str, out_dir: Path) -> Path:
-        """Render and save a SHAP waterfall plot PNG for one client. Returns the file path."""
-        out_dir.mkdir(parents=True, exist_ok=True)
-        explanation = self._explainer(x_row.reshape(1, -1))
-        explanation.feature_names = self._feature_names
-
-        fig = plt.figure(figsize=(9, 6))
-        shap.plots.waterfall(explanation[0], show=False, max_display=12)
-        out_path = out_dir / f"waterfall_{_safe_filename_component(client_id)}.png"
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logger.info("Waterfall plot for %s written to %s", client_id, out_path)
-        return out_path
 
     def render_summary(self, X: np.ndarray, out_dir: Path, sample_size: int = 2000) -> Path:
         """Render a global SHAP summary (beeswarm) plot over a sample of the dataset."""

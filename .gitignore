@@ -9,10 +9,13 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Data & model artifacts (regenerate via `make dataset train eval`)
+# Input dataset (regenerate via `make dataset`)
 data/*.parquet
-models/
-reports/
+
+# MLflow store: models, preprocessors, held-out splits, metrics, plots and the
+# registry all live here — the pipeline writes nowhere else.
+# Regenerate via `make train eval`.
+mlruns/
 
 # Node / frontend
 frontend/node_modules/
@@ -21,7 +24,6 @@ frontend/dist/
 # Env
 .env
 .env.local
-uv.lock
 
 # OS / editor
 .DS_Store

@@ -51,7 +51,7 @@ export default function ShapChart({ explanation, loading }) {
         </h3>
       </div>
       <p className="font-body text-xs text-paper-500 mb-4">
-        Base rate {explanation.base_value.toFixed(2)} · top {data.length} drivers by magnitude
+        Base value {explanation.base_value.toFixed(2)} · top {data.length} drivers by magnitude
       </p>
 
       <div className="flex-1 min-h-[280px]">

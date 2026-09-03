@@ -8,6 +8,7 @@ unit-testable without spinning up an MCP transport.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +30,15 @@ from ml_pipeline.config import MLConfig, config
 from ml_pipeline.models import Classifier
 from ml_pipeline.preprocessing import get_feature_names, to_feature_frame
 from ml_pipeline.shap_explainer import CreditRiskExplainer
+from ml_pipeline.tracking import (
+    HOLDOUT_ARTIFACT,
+    METADATA_ARTIFACT,
+    METRICS_ARTIFACT,
+    PREPROCESSOR_ARTIFACT,
+    SHAP_BACKGROUND_ARTIFACT,
+    RegisteredModel,
+    resolve_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,64 +61,81 @@ class ModelBundle:
     explainer: CreditRiskExplainer
     feature_names: list[str]
     model_version: str
+    run_id: str
+    artifacts_dir: Path
 
 
-def load_model_bundle(cfg: MLConfig = config) -> ModelBundle:
-    """Load the trained model + preprocessor + SHAP explainer from disk.
+def build_model_bundle(cfg: MLConfig, target: RegisteredModel) -> ModelBundle:
+    """Assemble the scoring bundle from one registry-resolved model version.
 
-    Raises FileNotFoundError with an actionable message if artifacts are
-    missing (a common first-run pitfall this makes explicit rather than
-    surfacing an opaque joblib traceback).
+    The preprocessor and SHAP background come from the artifacts of the run
+    that produced this exact version, so the transform applied at serving
+    time is provably the one the model was fitted with.
+
+    Trust boundary: these artifacts are unpickled, so the tracking store must
+    be trusted like code — pointing `FINRISK_MLFLOW_TRACKING_URI` at a store
+    you don't control is equivalent to running whatever it contains.
     """
-    if not cfg.model_path.exists() or not cfg.preprocessor_path.exists():
-        raise FileNotFoundError(
-            f"Model artifacts not found under {cfg.model_dir}. "
-            "Run `python -m ml_pipeline.make_dataset` then "
-            "`python -m ml_pipeline.train` before starting the MCP server."
-        )
-    model = joblib.load(cfg.model_path)
-    preprocessor = joblib.load(cfg.preprocessor_path)
+    preprocessor: ColumnTransformer = joblib.load(target.artifact(PREPROCESSOR_ARTIFACT))
+    background_path = target.artifacts_dir / SHAP_BACKGROUND_ARTIFACT
+    background: np.ndarray | None = (
+        joblib.load(background_path) if background_path.exists() else None
+    )
+
     feature_names = get_feature_names(preprocessor)
-    background_path = cfg.model_dir / "shap_background.joblib"
-    background = joblib.load(background_path) if background_path.exists() else None
     explainer = CreditRiskExplainer(
-        model=model,
+        model=target.model,
         feature_names=feature_names,
         model_type=cfg.model_type,
         background=background,
     )
     logger.info(
-        "Loaded model bundle: %d features, version=%s", len(feature_names), cfg.model_version
+        "Loaded model bundle: %d features, %s v%s (@%s, run %s)",
+        len(feature_names),
+        cfg.mlflow_registered_model,
+        target.version,
+        target.alias,
+        target.run_id,
     )
     return ModelBundle(
-        model=model,
+        model=target.model,
         preprocessor=preprocessor,
         explainer=explainer,
         feature_names=feature_names,
-        model_version=cfg.model_version,
+        model_version=target.display_version,
+        run_id=target.run_id,
+        artifacts_dir=target.artifacts_dir,
     )
+
+
+def load_model_bundle(cfg: MLConfig = config, *, alias: str | None = None) -> ModelBundle:
+    """Resolve a registry alias (default `champion`) and build its scoring bundle.
+
+    Raises `MlflowException` if the alias doesn't resolve and `FileNotFoundError`
+    if the run behind it is missing an artifact — both loudly, at startup: a
+    scoring server that can't load its declared model must not start rather
+    than answer from something else.
+    """
+    return build_model_bundle(cfg, resolve_model(cfg, alias=alias))
 
 
 class ClientStore:
     """Read-only lookup of client feature rows, keyed by `client_id`.
 
-    Backed by the held-out test split (`holdout_test_path`), not the full
-    training corpus — every client scoreable at runtime is therefore one the
-    currently-deployed model never trained on. Loading the full
-    `raw_data_path` instead would mean ~80% of demo-able client_ids were
-    memorized during training, quietly making the live demo look more
-    accurate than genuine out-of-sample performance. In production this
-    would be a call to a data warehouse / feature store (e.g. a Feast online
-    store) instead of a flat file.
+    Backed by the held-out split logged inside the served model's own MLflow
+    run, not the full training corpus — every client scoreable at runtime is
+    one that specific model never trained on. Serving the full dataset
+    instead would mean ~80% of demo-able client_ids were memorized during
+    training, quietly making the live demo look more accurate than genuine
+    out-of-sample performance. In production this would be a call to a data
+    warehouse / feature store instead of a flat file.
     """
 
-    def __init__(
-        self, data_path: Path = config.holdout_test_path, id_column: str = config.id_column
-    ) -> None:
+    def __init__(self, data_path: Path, id_column: str = config.id_column) -> None:
         if not data_path.exists():
             raise FileNotFoundError(
-                f"No held-out client dataset at {data_path}. Run `python -m ml_pipeline.train` "
-                "first — it writes this file alongside the model artifacts."
+                f"No held-out client dataset at {data_path}. Run "
+                "`python -m ml_pipeline.train` first — it logs this file into the run."
             )
         self._df = pd.read_parquet(data_path).set_index(id_column, drop=False)
         self._id_column = id_column
@@ -166,23 +193,23 @@ class ScoringService:
         proba = self._predict_proba(features_df)
         return self._to_score_result(client_id, proba)
 
-    def get_shap_explanation(self, client_id: str, render_plot: bool = True) -> ShapExplanation:
-        """Compute the local SHAP explanation for a client, optionally rendering a waterfall PNG."""
+    def get_shap_explanation(self, client_id: str) -> ShapExplanation:
+        """Compute the local SHAP explanation for a client.
+
+        Returns data, not files — an earlier version also rendered a
+        waterfall PNG per call that nothing read and that grew unboundedly.
+        The per-model equivalent (the global SHAP summary) is logged into
+        the MLflow run by `ml_pipeline.eval` instead.
+        """
         row = self._store.get_row(client_id)
         features_df = row.to_frame().T
         transformed = self._bundle.preprocessor.transform(features_df)
-        raw = row.drop(labels=["defaulted_12m"], errors="ignore").to_dict()
+        raw = row.drop(labels=[self._cfg.target_column], errors="ignore").to_dict()
         raw_values = {str(k): float(v) for k, v in raw.items() if _is_numeric(v)}
 
-        explanation = self._bundle.explainer.explain_row(
+        return self._bundle.explainer.explain_row(
             transformed[0], client_id=client_id, raw_values=raw_values
         )
-        if render_plot:
-            path = self._bundle.explainer.render_waterfall(
-                transformed[0], client_id=client_id, out_dir=self._cfg.shap_plots_dir
-            )
-            explanation = explanation.model_copy(update={"plot_path": str(path)})
-        return explanation
 
     def simulate_financial_scenario(self, client_id: str, params: ScenarioParams) -> ScenarioResult:
         """Apply a what-if perturbation to a client's features and re-score.
@@ -224,9 +251,42 @@ class ScoringService:
             narrative=narrative,
         )
 
+    def get_model_card(self) -> dict[str, object]:
+        """Metadata + held-out metrics of the served model, read from its own run.
 
-def build_default_scoring_service() -> ScoringService:
-    """Convenience factory used by both the MCP server and tests."""
-    bundle = load_model_bundle()
-    store = ClientStore()
-    return ScoringService(bundle=bundle, store=store)
+        Backs the `finrisk://model/card` MCP resource. Both files are
+        artifacts of the run the alias resolves to, so the card can never
+        describe a different model than the one answering the tools —
+        `metrics.json` is absent until `ml_pipeline.eval` has been run
+        against this version, which the empty dict makes visible rather than
+        papering over with someone else's numbers.
+        """
+        artifacts = self._bundle.artifacts_dir
+
+        def _read(name: str) -> dict[str, object]:
+            path = artifacts / name
+            return dict(json.loads(path.read_text())) if path.exists() else {}
+
+        return {
+            "registered_model": self._cfg.mlflow_registered_model,
+            "alias": self._cfg.mlflow_model_alias,
+            "model_version": self._bundle.model_version,
+            "run_id": self._bundle.run_id,
+            "metadata": _read(METADATA_ARTIFACT),
+            "metrics": _read(METRICS_ARTIFACT),
+        }
+
+
+def build_default_scoring_service(cfg: MLConfig = config) -> ScoringService:
+    """Build the service from a single registry resolution.
+
+    Resolving once — rather than once for the model and again for the client
+    store — is what guarantees the served model and the client rows it scores
+    come from the same run.
+    """
+    target = resolve_model(cfg)
+    return ScoringService(
+        bundle=build_model_bundle(cfg, target),
+        store=ClientStore(target.artifact(HOLDOUT_ARTIFACT), id_column=cfg.id_column),
+        cfg=cfg,
+    )

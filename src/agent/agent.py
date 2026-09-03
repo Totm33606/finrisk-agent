@@ -7,10 +7,14 @@ producing a structured `AgentAnalysisResult` (decision + narrative + full
 tool-call trajectory) with end-to-end Langfuse tracing.
 
 Run standalone:
-    python -m agent.agent SME-000123 --question "Should we approve this client?"
+    python -m agent.agent SME-000182 --question "Should we approve this client?"
 
 Run as an API (consumed by the React dashboard):
     uvicorn agent.agent:api --reload --port 8080
+
+The MCP server is reached over HTTP when `FINRISK_MCP_URL` is set (how the
+Docker stack wires it, with the scoring server as its own container), and
+spawned as a local stdio subprocess otherwise — see `_mcp_connection`.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import typer
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -71,9 +75,9 @@ specific, stated reason to diverge — and if you diverge, say why explicitly.
 def _build_llm() -> ChatOpenAI | AzureChatOpenAI:
     """Build the chat model. Priority: Azure OpenAI > a local server > plain OpenAI.
 
-    Mirrors the TOD-agent convention of Azure OpenAI with a reasoning-capable
-    model via env-driven configuration, while remaining runnable against
-    plain OpenAI for anyone cloning the repo without Azure access.
+    Azure first so a configured corporate deployment always wins, then a local
+    server (free, no key), then plain OpenAI — so cloning the repo without
+    Azure access still works.
 
     Setting `LOCAL_LLM_BASE_URL` switches to a local, OpenAI-API-compatible
     server instead — e.g. Ollama (`http://localhost:11434/v1`), LM Studio
@@ -117,31 +121,49 @@ class FinRiskAgentRuntime:
     expensive to set up per-call.
     """
 
-    def __init__(self, mcp_server_module: str = "mcp_server.server") -> None:
+    def __init__(
+        self, mcp_server_module: str = "mcp_server.server", mcp_url: str | None = None
+    ) -> None:
         self._mcp_server_module = mcp_server_module
+        # Explicit argument wins, then the environment, then stdio.
+        self._mcp_url = mcp_url if mcp_url is not None else os.getenv("FINRISK_MCP_URL")
         self._mcp_client: MultiServerMCPClient | None = None
         self._graph: Any = None
 
+    def _mcp_connection(self) -> dict[str, Any]:
+        """How to reach the MCP server: over HTTP if a URL is configured, else stdio.
+
+        stdio is the local default — it needs no running server, so
+        `python -m agent.agent SME-000182` stays a single command. HTTP is
+        what Docker Compose uses instead, since the scoring server runs as
+        its own container there.
+
+        Note the transport spelling differs on each side of the wire:
+        `langchain-mcp-adapters` names it `streamable_http`, the server CLI
+        takes FastMCP's `--transport streamable-http`.
+        """
+        if self._mcp_url:
+            logger.info("Connecting to the MCP server over HTTP at %s", self._mcp_url)
+            return {"url": self._mcp_url, "transport": "streamable_http"}
+        logger.info("Spawning the MCP server as a local stdio subprocess.")
+        return {
+            "command": "python",
+            "args": ["-m", self._mcp_server_module],
+            "transport": "stdio",
+        }
+
     async def start(self) -> None:
-        """Spawn the MCP server as a stdio subprocess and compile the ReAct agent.
+        """Connect to the MCP server and compile the ReAct agent.
 
         `MultiServerMCPClient` in the pinned `langchain-mcp-adapters` release
-        is an async context manager: entering it is what actually spawns the
-        stdio subprocess and performs the MCP handshake for every configured
+        is an async context manager: entering it is what performs the MCP
+        handshake (and, on stdio, spawns the subprocess) for every configured
         server. We enter it manually (rather than via `async with`) so the
-        subprocess stays alive for the lifetime of the runtime instead of
-        being torn down at the end of a `with` block, and close it explicitly
-        in `stop()`.
+        session stays alive for the lifetime of the runtime instead of being
+        torn down at the end of a `with` block, and close it explicitly in
+        `stop()`.
         """
-        self._mcp_client = MultiServerMCPClient(
-            {
-                "finrisk": {
-                    "command": "python",
-                    "args": ["-m", self._mcp_server_module],
-                    "transport": "stdio",
-                }
-            }
-        )
+        self._mcp_client = MultiServerMCPClient({"finrisk": self._mcp_connection()})
         await self._mcp_client.__aenter__()
         tools = self._mcp_client.get_tools()
         logger.info("Loaded %d MCP tools: %s", len(tools), [t.name for t in tools])
@@ -162,10 +184,10 @@ class FinRiskAgentRuntime:
         )
         config = {"callbacks": [handler]} if handler else {}
 
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"Client: {client_id}\nAnalyst question: {question}"),
-        ]
+        # No SystemMessage here: `create_react_agent(..., prompt=SYSTEM_PROMPT)`
+        # already prepends it to every invocation, and sending it twice just
+        # burns tokens on a duplicate.
+        messages = [HumanMessage(content=f"Client: {client_id}\nAnalyst question: {question}")]
 
         t0 = time.perf_counter()
         result_state = await self._graph.ainvoke({"messages": messages}, config=config)
@@ -210,7 +232,6 @@ class FinRiskAgentRuntime:
                         tool_input=call_info["args"],
                         tool_output_summary=_summarize_tool_output(msg.content),
                         raw_output=_parse_tool_output(msg.content),
-                        latency_ms=0.0,  # per-tool latency requires astream_events; see README
                         status="error"
                         if getattr(msg, "status", "success") == "error"
                         else "success",
@@ -351,7 +372,7 @@ cli = typer.Typer(add_completion=False)
 def analyze_cli(
     client_id: str, question: str = "Should we approve this client's credit request?"
 ) -> None:
-    """One-shot CLI run: `python -m agent.agent SME-000123 --question "..."`."""
+    """One-shot CLI run: `python -m agent.agent SME-000182 --question "..."`."""
 
     async def _run() -> None:
         rt = FinRiskAgentRuntime()

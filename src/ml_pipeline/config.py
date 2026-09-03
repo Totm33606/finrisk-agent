@@ -23,41 +23,43 @@ class MLConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FINRISK_", env_file=".env", extra="ignore")
 
     # --- Paths -------------------------------------------------------
+    # The raw dataset is the only path left outside the MLflow store: it's
+    # the pipeline's entry point, so it has to come from somewhere. Every
+    # produced artifact — model, preprocessor, held-out split, metrics,
+    # plots — lives in MLflow and nowhere else.
     data_dir: Path = PROJECT_ROOT / "data"
     raw_data_path: Path = PROJECT_ROOT / "data" / "clients.parquet"
-    model_dir: Path = PROJECT_ROOT / "models"
-    model_path: Path = PROJECT_ROOT / "models" / "lgbm_credit_risk.joblib"
-    preprocessor_path: Path = PROJECT_ROOT / "models" / "preprocessor.joblib"
-    metrics_path: Path = PROJECT_ROOT / "models" / "metrics.json"
-    holdout_test_path: Path = PROJECT_ROOT / "models" / "holdout_test.parquet"
-    shap_plots_dir: Path = PROJECT_ROOT / "reports" / "shap"
+
+    # --- MLflow tracking / registry ---------------------------------------
+    # `mlflow_dir` is a plain file store rather than `sqlite:///`: MLflow
+    # 2.x's file store already implements the registry surface used here
+    # (register, aliases, `models:/name@alias`), so a database would add a
+    # migration for nothing. Point `mlflow_tracking_uri` at an `http://`
+    # server to centralize runs for a team; leave it empty to use the local
+    # `mlflow_dir` file store.
+    mlflow_dir: Path = PROJECT_ROOT / "mlruns"
+    mlflow_tracking_uri: str = ""
+    mlflow_experiment: str = "finrisk-credit-risk"
+    mlflow_registered_model: str = "finrisk-credit-risk"
+    mlflow_model_alias: str = "champion"
 
     @model_validator(mode="before")
     @classmethod
     def _derive_dependent_paths(cls, data: Any) -> Any:
-        """Make `raw_data_path`/`model_path`/`preprocessor_path`/`metrics_path`/
-        `holdout_test_path` follow an overridden `data_dir`/`model_dir` unless
-        explicitly overridden themselves.
+        """Derive `raw_data_path` from `data_dir`, and the tracking URI from `mlflow_dir`.
 
-        Without this, e.g. `MLConfig(model_dir=tmp_path)` silently leaves `model_path`
-        pointing at the real `PROJECT_ROOT/models/...` — every caller that overrides only
-        the *_dir field (tests included) would otherwise read/write real project artifacts.
+        Without this, a test overriding only `mlflow_dir` would still write
+        into the developer's real `./mlruns` store.
         """
         if not isinstance(data, dict):
             return data
         data_dir = data.get("data_dir")
         if data_dir is not None and "raw_data_path" not in data:
             data["raw_data_path"] = Path(data_dir) / "clients.parquet"
-        model_dir = data.get("model_dir")
-        if model_dir is not None:
-            if "model_path" not in data:
-                data["model_path"] = Path(model_dir) / "lgbm_credit_risk.joblib"
-            if "preprocessor_path" not in data:
-                data["preprocessor_path"] = Path(model_dir) / "preprocessor.joblib"
-            if "metrics_path" not in data:
-                data["metrics_path"] = Path(model_dir) / "metrics.json"
-            if "holdout_test_path" not in data:
-                data["holdout_test_path"] = Path(model_dir) / "holdout_test.parquet"
+        if not data.get("mlflow_tracking_uri"):
+            # `.resolve()` before `.as_uri()`: the latter rejects relative paths.
+            mlflow_dir = Path(data.get("mlflow_dir") or PROJECT_ROOT / "mlruns")
+            data["mlflow_tracking_uri"] = mlflow_dir.resolve().as_uri()
         return data
 
     # --- Target / split ------------------------------------------------
@@ -86,11 +88,15 @@ class MLConfig(BaseSettings):
     categorical_features: list[str] = Field(default_factory=lambda: ["sector"])
 
     # --- Model selection -------------------------------------------------
-    # LightGBM is the default (best accuracy on this kind of tabular data);
-    # logistic_regression is available as a simpler, natively-interpretable
-    # alternative — both are built by `ml_pipeline.models.build_model` and
-    # served identically downstream (ScoringService, SHAP explanation).
-    model_type: Literal["lightgbm", "logistic_regression"] = "logistic_regression"
+    # LightGBM is the default: better precision/F1 at the operating threshold,
+    # which is what the decision policy acts on (logistic regression edges it
+    # on the threshold-free ranking metrics instead, so this isn't a clean
+    # win — see README). logistic_regression remains available as a simpler,
+    # natively-interpretable alternative; both are built by
+    # `ml_pipeline.models.build_model` and served identically downstream.
+    # Also selects the MLflow flavor `tracking.log_model` uses, so tests that
+    # build a model by hand should set this explicitly.
+    model_type: Literal["lightgbm", "logistic_regression"] = "lightgbm"
 
     # --- Model hyperparameters (LightGBM) -------------------------------
     lgbm_params: dict[str, object] = Field(

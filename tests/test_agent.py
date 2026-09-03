@@ -137,3 +137,42 @@ def test_build_llm_local_server_takes_precedence_over_plain_openai(
     llm = _build_llm()
 
     assert str(llm.openai_api_base) == "http://localhost:1234/v1"
+
+
+def test_mcp_connection_defaults_to_a_local_stdio_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No URL configured means no server to start first: `python -m agent.agent`
+    stays a single command locally."""
+    monkeypatch.delenv("FINRISK_MCP_URL", raising=False)
+
+    connection = FinRiskAgentRuntime()._mcp_connection()
+
+    assert connection["transport"] == "stdio"
+    assert connection["args"] == ["-m", "mcp_server.server"]
+
+
+def test_mcp_connection_uses_http_when_a_url_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FINRISK_MCP_URL` is how docker-compose points the agent at the mcp service.
+
+    The transport spelling is asserted deliberately: the adapter names it
+    `streamable_http` while the server CLI takes `--transport streamable-http`,
+    and getting that wrong fails only at connection time.
+    """
+    monkeypatch.setenv("FINRISK_MCP_URL", "http://mcp:8000/mcp")
+
+    connection = FinRiskAgentRuntime()._mcp_connection()
+
+    assert connection == {"url": "http://mcp:8000/mcp", "transport": "streamable_http"}
+
+
+def test_explicit_mcp_url_argument_wins_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FINRISK_MCP_URL", "http://from-env:8000/mcp")
+
+    connection = FinRiskAgentRuntime(mcp_url="http://explicit:9000/mcp")._mcp_connection()
+
+    assert connection["url"] == "http://explicit:9000/mcp"

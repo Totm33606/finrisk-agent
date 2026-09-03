@@ -1,0 +1,19 @@
+# Build context for Dockerfile.backend (context: the repo root). The image only
+# COPYs pyproject.toml/uv.lock/README.md and src/, so nothing below would end up
+# in it anyway — but everything here is still uploaded to the daemon on every
+# build, and mlruns/ + .venv/ + node_modules are by far the largest things in
+# the tree.
+.venv
+mlruns
+data
+frontend/node_modules
+frontend/dist
+.git
+__pycache__
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+.env

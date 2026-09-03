@@ -5,7 +5,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
 WORKDIR /app
 
 # libgomp1 is required by LightGBM's OpenMP-parallelized boosters at runtime.
@@ -13,15 +14,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Dependencies layer (cached independently of source changes) ------------
+# `--locked` installs exactly what uv.lock pins, not whatever a fresh resolve
+# would pick — the reason to care: langchain-mcp-adapters has no upper bound
+# on mcp, and mcp 2.0 renamed an import it relies on, so an unlocked install
+# here can produce an image that fails at startup even though tests pass
+# locally. README.md is needed too: hatchling reads it as package metadata.
 FROM base AS deps
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -e .
+    uv sync --locked --no-install-project
 
 # --- Runtime image ------------------------------------------------------------
 FROM deps AS runtime
 COPY src/ ./src/
-COPY README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked
 ENV PYTHONPATH=/app/src
 
 # Non-root user: standard hardening for a production-facing image.

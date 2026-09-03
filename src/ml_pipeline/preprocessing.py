@@ -56,8 +56,8 @@ def get_feature_names(preprocessor: ColumnTransformer) -> list[str]:
     """Return the flat output feature names post-transform (post-fit only).
 
     Required to align SHAP contributions (computed on the transformed
-    matrix) back to human-readable feature names for the waterfall plots
-    and the agent's natural-language explanations.
+    matrix) back to human-readable feature names for the dashboard's
+    attribution chart and the agent's natural-language explanations.
     """
     return list(preprocessor.get_feature_names_out())
 
