@@ -129,8 +129,10 @@ class ScenarioResult(BaseModel):
 class AgentStep(BaseModel):
     """One reasoning/tool-call step in the agent's trajectory.
 
-    This is the payload rendered live by the frontend's Chain-of-Thought
-    panel (`AgentTrace.jsx`) — one entry per MCP tool invocation, in order.
+    This is the payload rendered by the frontend's Chain-of-Thought panel
+    (`AgentTrace.jsx`) — one entry per MCP tool invocation, in order. The
+    whole list arrives at once inside `AgentAnalysisResult`, not step by
+    step: there is no streaming endpoint.
     """
 
     step_index: int

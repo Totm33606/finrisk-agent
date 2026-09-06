@@ -78,6 +78,37 @@ def test_start_run_records_tags_and_yields_a_usable_run_id(cfg: MLConfig) -> Non
     assert run.data.tags["model_version"] == cfg.model_version
 
 
+def test_start_run_names_the_run_after_the_model_version_not_the_phase(cfg: MLConfig) -> None:
+    """`eval.py` resumes this run to add its held-out metrics, so naming it
+    "train" would describe only half of what the MLflow UI shows inside it."""
+    with tracking.start_run(cfg) as run_id:
+        pass
+
+    run = MlflowClient(tracking_uri=cfg.mlflow_tracking_uri).get_run(run_id)
+    assert run.data.tags["mlflow.runName"] == f"{cfg.model_type}-v{cfg.model_version}"
+
+
+def test_set_tags_applies_to_a_resumed_run(cfg: MLConfig) -> None:
+    """How `eval.py` marks a run as scored — `start_run`'s own tags can't,
+    since the evaluation happens in a separate process afterwards."""
+    with tracking.start_run(cfg) as run_id:
+        pass
+
+    with tracking.resume_run(cfg, run_id):
+        tracking.set_tags({"evaluated": "true"})
+
+    run = MlflowClient(tracking_uri=cfg.mlflow_tracking_uri).get_run(run_id)
+    assert run.data.tags["evaluated"] == "true"
+
+
+def test_set_tags_outside_a_run_does_not_create_an_orphan(cfg: MLConfig) -> None:
+    """Same guard as the `log_*` helpers: MLflow's fluent API would otherwise
+    auto-create a run to hang the tag on."""
+    tracking.set_tags({"stray": "true"})
+
+    assert mlflow.active_run() is None
+
+
 def test_start_run_rejects_an_experiment_with_a_foreign_artifact_location(
     cfg: MLConfig,
 ) -> None:

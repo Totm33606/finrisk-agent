@@ -105,9 +105,10 @@ already familiar with them.
 - **LangGraph**: the library used to build the agent's reasoning loop
   (ask → call a tool → read the result → decide the next step, a pattern
   called *ReAct*).
-- **Langfuse**: a dashboard that records everything the agent did — which
-  tools it called, with what inputs/outputs, and how long each step took —
-  so a human can review any past run afterwards.
+- **Langfuse**: a dashboard for reviewing past AI runs — which tools were
+  called, with what inputs/outputs, how long each step took and what the
+  tokens cost. (What this repo wires up today is the LLM-call side of that;
+  [Agent & observability](#agent--observability) is precise about the rest.)
 - **MLflow**: the same idea, but for the *statistical model* rather than the
   AI agent — it keeps a numbered history of every training run (settings
   used, accuracy obtained, charts produced) and a registry that records
@@ -121,16 +122,15 @@ flowchart TD
     API["🤖 FastAPI Agent Layer<br/>LangGraph ReAct agent<br/>(agent/agent.py)"]
     MCP["🔌 FastMCP Server<br/>get_credit_score · get_shap_explanation<br/>simulate_financial_scenario<br/>(mcp_server/server.py)"]
     ML["📊 Core ML Pipeline<br/>preprocessing · LightGBM · SHAP<br/>(ml_pipeline/*)"]
-    LF["📝 Langfuse<br/>full trace: AI calls, tool calls, cost"]
+    LF["📝 Langfuse<br/>agent-side trace: LLM calls, cost,<br/>tool calls as generic spans"]
     MLF["📈 MLflow<br/>runs, metrics, artifacts<br/>@champion model registry"]
 
     UI -->|"REST /analyze"| API
     API -->|"MCP (HTTP in Docker,<br/>stdio locally)"| MCP
-    MCP -->|"ScoringService"| ML
+    MCP -->|"in-process import:<br/>transform · predict · explain"| ML
     API -.->|"logged to"| LF
-    MCP -.->|"logged to"| LF
-    ML -.->|"train/eval tracked to"| MLF
-    MLF -.->|"@champion model<br/>+ its preprocessor &amp; client rows"| MCP
+    ML -.->|"train.py / eval.py<br/>write runs to"| MLF
+    MCP -.->|"resolves @champion, read-only:<br/>model + its preprocessor &amp; client rows"| MLF
 
     classDef ui fill:#1c3c3c,stroke:#0f2626,color:#ffffff
     classDef agent fill:#6f42c1,stroke:#4a2c85,color:#ffffff
@@ -147,9 +147,17 @@ flowchart TD
     class MLF mlops
 ```
 
-*(Dashboard → Agent → MCP tools → ML pipeline, with every AI call and tool
-call along the way logged to Langfuse, and every training run — plus the
-model actually being served — recorded in MLflow.)*
+*(Every arrow points from the initiator to what it depends on. Two of them
+are worth reading carefully. `ml_pipeline` appears once but wears two hats:
+`train.py`/`eval.py` **write** runs into MLflow, while `preprocessing`,
+`models` and `shap_explainer` are **imported** by the scoring server and
+execute inside its process — a SHAP explanation is computed live there, not
+read back from a run. And the scoring server **reads** MLflow rather than
+being pushed to: it resolves `@champion` itself, against a store it mounts
+read-only, which is why that arrow runs MCP → MLflow and not the reverse.
+Note too that the tracing arrow starts at the agent, not the MCP server: the
+scoring server emits plain application logs and is not instrumented — see
+[Agent & observability](#agent--observability).)*
 
 Four layers, each independently replaceable. **Why split it up this way:**
 
@@ -187,7 +195,7 @@ finrisk-agent/
 │   │   └── server.py          # the 3 tools + 1 resource exposed to the agent
 │   └── agent/
 │       ├── agent.py           # the AI agent + its web API (MCP over HTTP or stdio)
-│       └── observability.py   # Langfuse logging setup
+│       └── observability.py   # Langfuse setup (LLM calls; see its docstring for scope)
 ├── frontend/                  # Vite + React + Tailwind dashboard
 │   └── src/
 │       ├── App.jsx
@@ -387,16 +395,25 @@ make mlflow-ui                            # browse it at http://localhost:5000
 
 **One run per model, not one per script.** `train.py` opens the run;
 `eval.py` — a separate process — resolves the alias, finds the run behind it
-and *resumes* it rather than opening a detached one. A `pr_auc` that isn't
+and *resumes* it rather than opening a detached one. A PR-AUC that isn't
 attached to the hyperparameters, the seed and the split that produced it
-can't be compared against anything. One run therefore holds:
+can't be compared against anything.
+
+Because that one run spans both phases, nothing inside it is named after a
+phase. The run is named for the model version it produces
+(`lightgbm-v1.0.0`), not for the script that opened it — a run labelled
+"train" in the MLflow UI would be describing only half of what it contains.
+For the same reason, metric keys carry a namespace saying which data they
+were measured on rather than which script logged them: a bare `roc_auc`
+can't tell you whether it came from a training fold or the held-out split,
+`holdout/roc_auc` can. One run therefore holds:
 
 | Recorded | What lands there |
 |---|---|
-| Params | model hyperparameters, `model_type`, `target_column`, `test_size`, `n_cv_folds`, `random_state`, `decision_threshold`, `tuned_with_optuna` |
-| Metrics | `n_train` / `n_test` / `train_default_rate` and, under `--tune`, `cv_pr_auc` (train-side); `roc_auc` / `pr_auc` / precision / recall / F1 and the four confusion-matrix cells (eval-side) |
+| Params | model hyperparameters, `model_type`, `target_column`, `test_size`, `n_cv_folds`, `random_state`, `tuned_with_optuna`. Not `decision_threshold` — params are immutable in MLflow, and that one has to follow a re-evaluation, so it is a tag |
+| Metrics | Namespaced by which data they were measured on, since both phases land in one run: `train/n_rows`, `train/n_holdout_rows`, `train/default_rate`; under `--tune`, `cv/pr_auc` and `cv/n_trials`; and from `eval.py`, `holdout/roc_auc`, `holdout/pr_auc`, `holdout/precision_at_threshold` / `recall` / `f1`, plus the four `holdout/cm_*` confusion-matrix cells. MLflow's UI groups these into `train` / `cv` / `holdout` sections by the prefix |
 | Artifacts | the model, `preprocessor.joblib`, `holdout_test.parquet`, `metadata.json`, `metrics.json`, the four `diagnostics/` PNGs, and — for logistic regression only, since `TreeExplainer` needs none — `shap_background.joblib` |
-| Tags | `git_sha`, `model_type`, `model_version`, `decision_threshold` |
+| Tags | `git_sha`, `model_type`, `model_version`, `decision_threshold` (the operating point this run's held-out metrics were measured at — re-stamped whenever `eval.py` re-measures), and `evaluated` / `evaluated_alias`, so the runs table can tell a trained-only run from a scored one |
 
 **Everything follows an alias, not the filesystem.** `--alias` selects which
 registry alias to publish under or read from, and it is the same flag on
@@ -476,6 +493,19 @@ uv run python -m mcp_server.server --transport streamable-http --port 8000   # n
 uv run python -m mcp_server.server --alias challenger           # serve a candidate instead
 ```
 
+**The decision threshold comes from the run, not from the environment.** It
+is what turns a PD into APPROVE/REVIEW/DECLINE, so it is pinned to the served
+model version exactly like its preprocessor: the server reads the
+`decision_threshold` tag off the resolved run, uses that value for every
+score, and states it on the model card. If `FINRISK_DECISION_THRESHOLD`
+disagrees with what the run was evaluated at, the server **refuses to
+start** — serving 0.45 while the model card advertises a precision/recall
+pair measured at 0.30 would attach live decisions to metrics that never
+measured them. To move a served model to a new threshold, re-run
+`python -m ml_pipeline.eval` at it: that re-measures the held-out metrics
+and re-stamps the tag together, so the two can never describe different
+operating points.
+
 **Transports.** stdio is the local default: the agent spawns the server
 itself, so nothing has to be running first. HTTP (`streamable-http`) is what
 the Docker stack uses — the scoring server becomes its own container and the
@@ -533,21 +563,44 @@ order). No API key or cost: set `LOCAL_LLM_BASE_URL` to any
 OpenAI-API-compatible local server — [Ollama](https://ollama.com)
 (`http://localhost:11434/v1`), LM Studio, or llama.cpp's server all work,
 as long as the model you run supports tool calling (e.g.
-`qwen2.5:7b-instruct` fits comfortably in 8GB of VRAM). Every run
-is logged to Langfuse with tags for the session, user, and client — so
-later, anyone can look up exactly which tools were called, with what
-inputs, and what the AI concluded, for any past decision. Logging is
+`qwen2.5:7b-instruct` fits comfortably in 8GB of VRAM). Logging is
 optional: the agent still works fine locally without Langfuse configured,
 it just won't be recorded.
+
+**What Langfuse currently captures — and what it doesn't.** Tracing here is
+still LLMOps rather than AgentOps, and the gap is worth stating plainly
+before you rely on a trace for an audit:
+
+| | Status |
+|---|---|
+| LLM calls (prompt, completion, tokens, cost, latency) | ✅ Typed `GENERATION` observations |
+| Tool calls (name, input, output, latency, errors) | ⚠️ Emitted, but as *generic* spans — Langfuse v2 has no tool observation type, so an MCP call is visually indistinguishable from LangGraph's own internal node spans, and carries no domain fields (PD, risk band, model version) |
+| The agent's final decision on the trace | ❌ Never written — `trace.update(output=...)` is not called, so you cannot query "show me every DECLINE" |
+| Quality scores (grounded in tools? decision consistent with the model's own recommendation?) | ❌ No `score()` calls |
+| MCP server-side spans | ❌ The scoring server writes application logs only; nothing reaches Langfuse from that process |
+| Session / user grouping | ⚠️ Both fields are set, but `session_id` is a fresh UUID per request and `user_id` is a hardcoded constant, so neither dimension groups anything yet |
+
+The trace metadata that *is* set (session, user, client id, release, tags)
+comes from [`observability.py`](src/agent/observability.py), which is also
+where the remaining rows would be closed — see
+[Design decisions & trade-offs](#design-decisions--trade-offs).
 
 ## Dashboard
 
 A Vite + React + Tailwind console with a deliberately non-default visual
 language (ink-navy/amber "financial terminal" palette, Fraunces/JetBrains
 Mono type pairing) built around three panels: the score gauge
-(`ScoreCard`), the "why this score" chart (`ShapChart`), and a live feed of
-the agent's tool calls as they happen (`AgentTrace`) — so you can watch the
-AI's reasoning step by step instead of just waiting for a final answer.
+(`ScoreCard`), the "why this score" chart (`ShapChart`), and the agent's
+tool-call trajectory (`AgentTrace`) — so a reviewer can read back which
+tools the agent consulted, in order, with what inputs and what each
+returned, instead of being handed a bare verdict.
+
+Note that the trajectory is rendered **after** the run completes, not
+streamed: `/analyze` is a single blocking POST that returns the whole
+`AgentAnalysisResult` at once, and the panel shows a spinner until then.
+Streaming the steps as they happen needs per-tool events the agent doesn't
+emit yet — the same instrumentation gap as the tool-tracing rows in
+[Agent & observability](#agent--observability).
 
 ```bash
 cd frontend
@@ -664,7 +717,7 @@ Each major dependency was picked over a real alternative, not by default:
 | Model↔agent boundary | MCP (via FastMCP) | Keeps the scoring model fully independent of whichever AI agent or provider uses it — swap the agent framework later, and the model side is untouched. The alternative (wiring functions straight into one agent framework) would lock the two together. |
 | Agent orchestration | LangGraph | A ready-made, tested "ask → call a tool → read result → repeat" loop, instead of hand-writing that control flow (more code, more places for bugs). |
 | Artifact store, tracking & registry | MLflow (`./mlruns` file store) | The default choice for versioning training runs and promoting a model to production, and the one that keeps the model side symmetrical with the Langfuse-traced agent side. Used as the *only* artifact store rather than as a log alongside local files — one source of truth can't disagree with itself, at the cost of making it a hard dependency of serving. Kept on the plain file store rather than a `sqlite:///` backend: MLflow 2.x's file store implements the whole registry surface used here (register, aliases, `models:/name@alias` loading), so a database would add a migration and a split artifact root for nothing. |
-| Observability | Langfuse | Purpose-built for recording what an AI agent did — tool calls, inputs/outputs, cost — which is exactly the audit trail a finance use case needs. It's optional: the agent still runs without it. |
+| Observability | Langfuse | Purpose-built for recording what an AI agent did — tool calls, inputs/outputs, cost — which is exactly the audit trail a finance use case needs. What is wired up today is the LLM-call half of that; see [Agent & observability](#agent--observability) for the honest per-signal breakdown. It's optional: the agent still runs without it. |
 | Configuration | pydantic-settings | One typed, validated settings file shared by every script, so they can't silently drift out of sync with each other. |
 | CLIs | typer | Turns ordinary Python functions into command-line tools with almost no extra code. |
 | Packaging & running | uv | One fast tool for creating environments, installing dependencies, and running scripts — replacing the usual pip + venv combo, and working the same way on Windows, macOS, and Linux. |

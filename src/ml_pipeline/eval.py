@@ -44,6 +44,7 @@ from ml_pipeline.models import Classifier
 from ml_pipeline.preprocessing import get_feature_names, to_feature_frame
 from ml_pipeline.shap_explainer import CreditRiskExplainer
 from ml_pipeline.tracking import (
+    DECISION_THRESHOLD_TAG,
     DIAGNOSTICS_DIR,
     HOLDOUT_ARTIFACT,
     METRICS_ARTIFACT,
@@ -54,6 +55,7 @@ from ml_pipeline.tracking import (
     log_metrics,
     resolve_model,
     resume_run,
+    set_tags,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -163,14 +165,30 @@ def _plot_shap_summary(
         return None
 
 
+# Already recorded by `train.py` as a *parameter* of the same run, so
+# re-logging it as a metric here would put one number in two places that
+# could later disagree. It stays in `metrics.json` (and therefore in the
+# model card), which is the artifact that has to be self-describing.
+_PARAM_BACKED_KEYS = frozenset({"decision_threshold"})
+
+# Namespaced so the run — which also holds `train/*` and `cv/*` from the
+# training phase — says which data each number was measured on. MLflow's UI
+# groups metrics into collapsible sections by this prefix.
+HOLDOUT_METRIC_PREFIX = "holdout/"
+
+
 def _mlflow_metrics(metrics: dict[str, float | list[list[int]]]) -> dict[str, float]:
-    """Flatten `compute_metrics` output into the scalars MLflow accepts.
+    """Flatten `compute_metrics` output into the namespaced scalars MLflow accepts.
 
     The confusion matrix is the only non-scalar; it is split into its four
     cells rather than dropped, since TN/FP/FN/TP are what a credit reviewer
     actually argues about when a threshold is being challenged.
     """
-    flat = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+    flat = {
+        k: float(v)
+        for k, v in metrics.items()
+        if isinstance(v, (int, float)) and k not in _PARAM_BACKED_KEYS
+    }
     cm = metrics.get("confusion_matrix")
     if isinstance(cm, list) and len(cm) == 2 and all(len(row) == 2 for row in cm):
         flat |= {
@@ -179,7 +197,7 @@ def _mlflow_metrics(metrics: dict[str, float | list[list[int]]]) -> dict[str, fl
             "cm_false_negative": float(cm[1][0]),
             "cm_true_positive": float(cm[1][1]),
         }
-    return flat
+    return {f"{HOLDOUT_METRIC_PREFIX}{key}": value for key, value in flat.items()}
 
 
 @app.command()
@@ -195,8 +213,10 @@ def run(
     Which model is evaluated is a registry alias, not whatever files happen
     to sit on disk — `--alias challenger` scores a candidate without
     touching what's currently served. Results are written back into that
-    model's own run (resumed, not a second one), so `pr_auc` always stays
-    attached to the hyperparameters that produced it.
+    model's own run (resumed, not a second one) under the `holdout/`
+    namespace, so `holdout/pr_auc` always stays attached to the
+    hyperparameters that produced it — and stays distinguishable from the
+    `cv/` and `train/` numbers already sitting in that run.
     """
     cfg = config
     target = resolve_model(cfg, alias=alias or None)
@@ -220,6 +240,21 @@ def run(
 
         with resume_run(cfg, target.run_id):
             log_metrics(_mlflow_metrics(metrics))
+            # `evaluated` makes "has this version actually been scored?"
+            # answerable from the runs table rather than by opening each run
+            # to look for `holdout/*` metrics. Re-stamping the threshold is
+            # what keeps that tag honest: the metrics just written describe
+            # `cfg.decision_threshold`, so the tag the scoring server checks
+            # itself against has to describe the same operating point —
+            # which is what makes re-running this command the cheap way to
+            # move a served model to a new threshold.
+            set_tags(
+                {
+                    "evaluated": "true",
+                    "evaluated_alias": target.alias,
+                    DECISION_THRESHOLD_TAG: str(cfg.decision_threshold),
+                }
+            )
             log_artifact(staging / METRICS_ARTIFACT)
             for plot in ("roc_curve.png", "pr_curve.png", "confusion_matrix.png"):
                 log_artifact(staging / plot, artifact_path=DIAGNOSTICS_DIR)

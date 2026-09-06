@@ -4,7 +4,8 @@ A LangGraph ReAct agent that consumes the FinRisk-Agent MCP server's three
 tools (`get_credit_score`, `get_shap_explanation`, `simulate_financial_scenario`)
 to answer a financial analyst's natural-language question about a client,
 producing a structured `AgentAnalysisResult` (decision + narrative + full
-tool-call trajectory) with end-to-end Langfuse tracing.
+tool-call trajectory), traced to Langfuse — see `agent.observability` for
+exactly which parts of a run reach the trace and which do not.
 
 Run standalone:
     python -m agent.agent SME-000182 --question "Should we approve this client?"
@@ -343,7 +344,13 @@ class AnalyzeRequest(BaseModel):
 
 @api.post("/analyze", response_model=AgentAnalysisResult)
 async def analyze(payload: AnalyzeRequest) -> AgentAnalysisResult:
-    """Run the agent and return the full structured result (used for non-streaming clients)."""
+    """Run the agent and return the full structured result.
+
+    Atomic by design as it stands: the caller blocks for the whole ReAct
+    loop and receives the complete trajectory in one response. There is no
+    streaming variant — the dashboard's trace panel renders these steps
+    after the fact, not as they happen.
+    """
     try:
         return await runtime.analyze(payload.client_id, payload.question)
     except Exception as exc:

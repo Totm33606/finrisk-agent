@@ -14,6 +14,7 @@ from ml_pipeline.config import MLConfig
 from ml_pipeline.eval import compute_metrics
 from ml_pipeline.make_dataset import _simulate
 from ml_pipeline.tracking import (
+    DECISION_THRESHOLD_TAG,
     DIAGNOSTICS_DIR,
     HOLDOUT_ARTIFACT,
     METADATA_ARTIFACT,
@@ -48,6 +49,23 @@ def test_compute_metrics_threshold_changes_precision_recall_tradeoff() -> None:
     assert loose["recall_at_threshold"] == 1.0
     assert strict["recall_at_threshold"] == 0.0
     assert strict["precision_at_threshold"] == 0.0  # zero_division=0, not a NaN/exception
+
+
+def test_mlflow_metrics_namespaces_every_key_and_splits_the_confusion_matrix() -> None:
+    """The run also holds `train/*` and `cv/*`, so a bare `roc_auc` there
+    couldn't say which data it was measured on."""
+    metrics = compute_metrics(np.array([0, 0, 1, 1]), np.array([0.1, 0.2, 0.8, 0.9]), threshold=0.5)
+
+    flat = eval_module._mlflow_metrics(metrics)
+
+    assert all(key.startswith("holdout/") for key in flat)
+    assert flat["holdout/roc_auc"] == 1.0
+    assert flat["holdout/cm_true_positive"] == 2.0
+    # Logged by `train.py` as a param of this same run; a second copy as a
+    # metric is one that can drift.
+    assert "holdout/decision_threshold" not in flat
+    # The non-scalar is split into cells, not silently dropped.
+    assert "holdout/confusion_matrix" not in flat
 
 
 def _tmp_cfg(tmp_path: Path, experiment: str) -> MLConfig:
@@ -93,11 +111,23 @@ def test_run_end_to_end_records_one_shared_mlflow_run(
     run_id = runs[0].info.run_id
 
     run = client.get_run(run_id)
-    # Training-side and evaluation-side facts on the same run:
+    # Training-side and evaluation-side facts on the same run, each carrying
+    # the namespace that says which data it was measured on — the point of
+    # the prefixes, given both phases land in one run.
     assert run.data.params["model_type"] == cfg.model_type
-    assert run.data.metrics["n_train"] > 0
-    assert 0.0 <= run.data.metrics["roc_auc"] <= 1.0
-    assert run.data.metrics["cm_true_positive"] >= 0
+    assert run.data.metrics["train/n_rows"] > 0
+    assert 0.0 <= run.data.metrics["holdout/roc_auc"] <= 1.0
+    assert run.data.metrics["holdout/cm_true_positive"] >= 0
+    assert run.data.tags["evaluated"] == "true"
+    # `decision_threshold` lives on the run exactly once, as a mutable tag —
+    # not as a metric and not as an immutable param, either of which would be
+    # a second copy free to go stale when `eval.py` re-measures at a new one.
+    assert run.data.tags[DECISION_THRESHOLD_TAG] == str(cfg.decision_threshold)
+    assert "holdout/decision_threshold" not in run.data.metrics
+    assert "decision_threshold" not in run.data.params
+    # The run is named for the model version it produces, not for the script
+    # that opened it — `eval.py` resumed this same run.
+    assert run.data.tags["mlflow.runName"] == f"{cfg.model_type}-v{cfg.model_version}"
 
     logged = {artifact.path for artifact in client.list_artifacts(run_id)}
     assert {
@@ -121,6 +151,48 @@ def test_run_end_to_end_records_one_shared_mlflow_run(
     # And the registry alias points at that same run.
     alias = client.get_model_version_by_alias(cfg.mlflow_registered_model, cfg.mlflow_model_alias)
     assert alias.run_id == run_id
+
+
+def test_eval_restamps_the_decision_threshold_tag_it_measured_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-evaluating at a new threshold must move the tag with the metrics.
+
+    This is what makes `python -m ml_pipeline.eval` the cheap remedy the
+    scoring server's startup error points at: the tag it checks against has
+    to describe the operating point the run's *current* held-out metrics
+    were measured at, not the one training happened to open with.
+    """
+    trained = _tmp_cfg(tmp_path, "test-threshold-restamp")
+    _simulate(n_clients=300, seed=trained.random_state).to_parquet(
+        trained.raw_data_path, index=False
+    )
+    monkeypatch.setattr(train_module, "config", trained)
+    train_module.run(tune=False, alias="")
+
+    client = MlflowClient(tracking_uri=trained.mlflow_tracking_uri)
+    run_id = client.get_model_version_by_alias(
+        trained.mlflow_registered_model, trained.mlflow_model_alias
+    ).run_id
+    assert client.get_run(run_id).data.tags[DECISION_THRESHOLD_TAG] == str(
+        trained.decision_threshold
+    )
+
+    retuned = MLConfig(
+        data_dir=tmp_path,
+        raw_data_path=tmp_path / "clients.parquet",
+        mlflow_dir=tmp_path / "mlruns",
+        n_cv_folds=2,
+        mlflow_experiment="test-threshold-restamp",
+        decision_threshold=0.45,
+    )
+    monkeypatch.setattr(eval_module, "config", retuned)
+    eval_module.run(alias="")
+
+    run = client.get_run(run_id)
+    assert run.data.tags[DECISION_THRESHOLD_TAG] == "0.45"
+    # The tag and the metrics it labels moved together, on the same run.
+    assert run.data.metrics["holdout/roc_auc"] >= 0.0
 
 
 def test_run_leaves_no_artifacts_outside_the_mlflow_store(
@@ -175,5 +247,5 @@ def test_run_evaluates_the_alias_it_is_given(
     monkeypatch.setattr(eval_module, "config", cfg)
     eval_module.run(alias="challenger")
 
-    assert "roc_auc" in client.get_run(challenger.run_id).data.metrics
-    assert "roc_auc" not in client.get_run(champion.run_id).data.metrics
+    assert "holdout/roc_auc" in client.get_run(challenger.run_id).data.metrics
+    assert "holdout/roc_auc" not in client.get_run(champion.run_id).data.metrics

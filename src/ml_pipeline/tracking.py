@@ -10,6 +10,13 @@ only statement of which run is served — so a stale local file can never
 disagree with the tracked metrics that describe it. `train.py` opens the run
 and `eval.py` resumes the same one (rather than a detached second run), so
 hyperparameters and held-out metrics always share one id.
+
+Because one run spans both phases, nothing in it is named after a phase: the
+run is named for the model version it produces, and metric keys are
+namespaced by which data they were measured on (`train/`, `cv/`, `holdout/`)
+rather than by which script logged them. A bare `roc_auc` cannot say whether
+it came from the training fold or the held-out split; `holdout/roc_auc` can,
+and MLflow's UI groups metrics into collapsible sections by that prefix.
 """
 
 from __future__ import annotations
@@ -44,6 +51,14 @@ SHAP_BACKGROUND_ARTIFACT = "shap_background.joblib"
 METADATA_ARTIFACT = "metadata.json"
 METRICS_ARTIFACT = "metrics.json"
 DIAGNOSTICS_DIR = "diagnostics"
+
+# Run tag holding the operating point the run's held-out metrics were measured
+# at. Same single-source-of-truth reason as the artifact names above: written
+# by `start_run`, re-stamped by `eval.py` when it re-measures, and read back by
+# the scoring server to refuse serving at a threshold nothing was evaluated at.
+# A tag rather than a param because params are immutable in MLflow, and this
+# value has to be able to follow a re-evaluation of the same run.
+DECISION_THRESHOLD_TAG = "decision_threshold"
 
 
 def _git_sha() -> str | None:
@@ -111,14 +126,20 @@ def _check_experiment_matches_store(cfg: MLConfig) -> None:
 
 
 @contextmanager
-def start_run(cfg: MLConfig = config, *, run_name: str = "train") -> Iterator[str]:
-    """Open a top-level MLflow run and yield its run id."""
+def start_run(cfg: MLConfig = config, *, run_name: str | None = None) -> Iterator[str]:
+    """Open a top-level MLflow run and yield its run id.
+
+    Defaults to naming the run after the model version it produces, not
+    after the script that opened it. `eval.py` resumes this same run to
+    record its held-out metrics and diagnostics, so a run called "train"
+    would be describing only half of what the MLflow UI shows inside it.
+    """
     _configure(cfg)
-    with mlflow.start_run(run_name=run_name) as run:
+    with mlflow.start_run(run_name=run_name or f"{cfg.model_type}-v{cfg.model_version}") as run:
         tags = {
             "model_type": cfg.model_type,
             "model_version": cfg.model_version,
-            "decision_threshold": str(cfg.decision_threshold),
+            DECISION_THRESHOLD_TAG: str(cfg.decision_threshold),
         }
         sha = _git_sha()
         if sha is not None:
@@ -177,6 +198,19 @@ def log_metrics(metrics: Mapping[str, float]) -> None:
     clean = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
     if clean:
         mlflow.log_metrics(clean)
+
+
+def set_tags(tags: Mapping[str, str]) -> None:
+    """Tag the active run; a no-op outside one, like the `log_*` helpers.
+
+    Unlike the tags `start_run` sets, these can be applied to a *resumed*
+    run — which is how `eval.py` records that a run has been evaluated, so
+    the MLflow runs table can tell a trained-only run from a scored one
+    (`tags.evaluated = 'true'`) without opening each of them.
+    """
+    if not _active():
+        return
+    mlflow.set_tags(dict(tags))
 
 
 def log_artifact(path: Path, *, artifact_path: str | None = None) -> None:
@@ -247,6 +281,7 @@ class RegisteredModel:
     version: str
     alias: str
     artifacts_dir: Path
+    tags: Mapping[str, str]
 
     @property
     def display_version(self) -> str:
@@ -268,6 +303,23 @@ class RegisteredModel:
                 "`python -m ml_pipeline.train` to publish a self-contained run."
             )
         return path
+
+    def tag(self, name: str) -> str:
+        """Value of one tag of this model's run, checked to exist.
+
+        The tag counterpart of `artifact()`, and raising for the same
+        reason: a missing tag means an incomplete run, not a default worth
+        guessing at — and the caller reading it is about to make a serving
+        decision with it.
+        """
+        value = self.tags.get(name)
+        if value is None:
+            raise KeyError(
+                f"Run {self.run_id} (version {self.version}, @{self.alias}) has no {name!r} "
+                "tag. It was produced by an older `train.py`; re-run "
+                "`python -m ml_pipeline.train` to publish a self-contained run."
+            )
+        return value
 
 
 def resolve_model(cfg: MLConfig = config, *, alias: str | None = None) -> RegisteredModel:
@@ -312,6 +364,10 @@ def resolve_model(cfg: MLConfig = config, *, alias: str | None = None) -> Regist
     # was already resolved above, so nothing is lost.
     model: Classifier = flavor.load_model(version.source)
     artifacts_dir = Path(mlflow.artifacts.download_artifacts(run_id=version.run_id))
+    # The run's tags travel with the model: they carry the decision threshold
+    # its metrics were measured at, which the scoring server checks its own
+    # config against before serving anything.
+    run_tags = dict(client.get_run(version.run_id).data.tags)
     logger.info(
         "Resolved %s@%s -> v%s (run %s)",
         cfg.mlflow_registered_model,
@@ -325,10 +381,12 @@ def resolve_model(cfg: MLConfig = config, *, alias: str | None = None) -> Regist
         version=str(version.version),
         alias=resolved_alias,
         artifacts_dir=artifacts_dir,
+        tags=run_tags,
     )
 
 
 __all__ = [
+    "DECISION_THRESHOLD_TAG",
     "DIAGNOSTICS_DIR",
     "HOLDOUT_ARTIFACT",
     "METADATA_ARTIFACT",
@@ -345,5 +403,6 @@ __all__ = [
     "register_version",
     "resolve_model",
     "resume_run",
+    "set_tags",
     "start_run",
 ]

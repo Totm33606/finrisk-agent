@@ -71,6 +71,7 @@ def wired_service(
         model_version="test",
         run_id="0" * 32,
         artifacts_dir=artifacts,
+        decision_threshold=tmp_cfg.decision_threshold,
     )
     store = ClientStore(tmp_cfg.raw_data_path, id_column=tmp_cfg.id_column)
     service = ScoringService(bundle=bundle, store=store, cfg=tmp_cfg)
@@ -125,11 +126,15 @@ def test_model_card_describes_the_served_model(wired_service: ScoringService) ->
         "alias",
         "model_version",
         "run_id",
+        "decision_threshold",
         "metadata",
         "metrics",
     }
     assert payload["model_version"] == wired_service._bundle.model_version
     assert payload["run_id"] == wired_service._bundle.run_id
+    # The operating point every `recommendation` was produced at — stated on
+    # the card rather than left implicit next to the metrics.
+    assert payload["decision_threshold"] == wired_service._bundle.decision_threshold
     assert payload["metadata"]["model_type"] == wired_service._cfg.model_type
     assert payload["metrics"]["roc_auc"] == 0.9
 

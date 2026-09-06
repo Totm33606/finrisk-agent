@@ -152,7 +152,7 @@ def _optuna_search(cfg: MLConfig, X: np.ndarray, y: np.ndarray) -> dict[str, Any
             }
         score = _cv_average_precision(cfg, X, y, params)
         log_params(params)
-        log_metrics({"cv_pr_auc": score})
+        log_metrics({"cv/pr_auc": score})
         return score
 
     sampler = optuna.samplers.TPESampler(seed=cfg.random_state)
@@ -164,7 +164,7 @@ def _optuna_search(cfg: MLConfig, X: np.ndarray, y: np.ndarray) -> dict[str, Any
     # Logged after `optimize` returns, so the active run is the parent again:
     # the best score belongs on the training run, the per-trial scores on the
     # nested children.
-    log_metrics({"cv_pr_auc": float(study.best_value), "n_trials": len(study.trials)})
+    log_metrics({"cv/pr_auc": float(study.best_value), "cv/n_trials": len(study.trials)})
     base_params = cfg.lgbm_params if cfg.model_type == "lightgbm" else cfg.logreg_params
     return {**base_params, **study.best_params}
 
@@ -188,7 +188,7 @@ def run(
     """
     cfg = config
 
-    with start_run(cfg, run_name="train") as run_id, TemporaryDirectory() as tmp:
+    with start_run(cfg) as run_id, TemporaryDirectory() as tmp:
         staging = Path(tmp)
         df = load_raw_dataset(cfg)
         train_df, test_df = _split(cfg, df)
@@ -208,11 +208,15 @@ def run(
         params = _optuna_search(cfg, X_train_raw, y_train) if tune else default_params
 
         log_params({**params, "tuned_with_optuna": tune, **_split_params(cfg)})
+        # `train/` because `eval.py` resumes this run and logs `holdout/*`
+        # into it: the prefix is what keeps "how many rows was it fitted on"
+        # distinguishable from "how many was it scored on" once both are
+        # sitting in the same run.
         log_metrics(
             {
-                "n_train": len(train_df),
-                "n_test": len(test_df),
-                "train_default_rate": float(train_df[cfg.target_column].mean()),
+                "train/n_rows": len(train_df),
+                "train/n_holdout_rows": len(test_df),
+                "train/default_rate": float(train_df[cfg.target_column].mean()),
             }
         )
 
@@ -268,18 +272,26 @@ def run(
 
 
 def _split_params(cfg: MLConfig) -> dict[str, Any]:
-    """The split/threshold settings worth recording next to the hyperparameters.
+    """The split settings worth recording next to the hyperparameters.
 
-    Recorded because they change what a metric *means*: the same `pr_auc` is
-    not comparable across two runs that used different test sizes, seeds or
-    decision thresholds.
+    Recorded because they change what a metric *means*: the same
+    `holdout/pr_auc` is not comparable across two runs that used different
+    test sizes or seeds.
+
+    `decision_threshold` is deliberately *not* here, despite belonging to
+    the same family. It lives on the run as a tag instead
+    (`tracking.DECISION_THRESHOLD_TAG`), because MLflow params are immutable
+    and that value has to be able to follow a re-evaluation of the same run
+    — `eval.py` re-stamps it whenever it re-measures. A param copy would be
+    a second source of truth free to go stale, and the scoring server
+    refuses to start when its configured threshold disagrees with the
+    served run's.
     """
     return {
         "model_type": cfg.model_type,
         "test_size": cfg.test_size,
         "n_cv_folds": cfg.n_cv_folds,
         "random_state": cfg.random_state,
-        "decision_threshold": cfg.decision_threshold,
         "target_column": cfg.target_column,
     }
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from ml_pipeline.models import Classifier
 from ml_pipeline.preprocessing import get_feature_names, to_feature_frame
 from ml_pipeline.shap_explainer import CreditRiskExplainer
 from ml_pipeline.tracking import (
+    DECISION_THRESHOLD_TAG,
     HOLDOUT_ARTIFACT,
     METADATA_ARTIFACT,
     METRICS_ARTIFACT,
@@ -63,6 +65,55 @@ class ModelBundle:
     model_version: str
     run_id: str
     artifacts_dir: Path
+    # Read from the served run, not from this process's config — see
+    # `_resolve_decision_threshold`. It is what turns a PD into
+    # APPROVE/REVIEW/DECLINE, so it belongs to the model version whose
+    # held-out precision/recall were measured at it, exactly like the
+    # preprocessor belongs to the model it was fitted with.
+    decision_threshold: float
+
+
+def _resolve_decision_threshold(cfg: MLConfig, target: RegisteredModel) -> float:
+    """The served run's decision threshold, refusing to differ from `cfg`.
+
+    The threshold is the one piece of the decision policy that used to
+    escape the run: every other input to a score — model, preprocessor,
+    feature names, the client rows themselves — is pinned to the resolved
+    version, while this came from whatever `FINRISK_DECISION_THRESHOLD`
+    happened to be set to in the serving process. Train at 0.30, serve at
+    0.45, and the model card keeps advertising a precision/recall pair that
+    was never measured at the operating point actually deciding cases.
+
+    So the run wins, and a disagreement is fatal at startup rather than
+    silent per request: an operator who set the variable meant it, and
+    quietly overriding them would be its own kind of wrong.
+    """
+    recorded = target.tag(DECISION_THRESHOLD_TAG)
+    try:
+        threshold = float(recorded)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Run {target.run_id} (version {target.version}, @{target.alias}) has a "
+            f"{DECISION_THRESHOLD_TAG!r} tag of {recorded!r}, which is not a number. "
+            "Re-run `python -m ml_pipeline.train` to publish a well-formed run."
+        ) from exc
+
+    # `isclose` rather than `!=`: both sides are floats that made a round trip
+    # through `str()`, and a spurious startup failure would be worse than the
+    # skew this guards against.
+    if not math.isclose(threshold, cfg.decision_threshold, rel_tol=1e-9, abs_tol=1e-12):
+        raise RuntimeError(
+            f"Refusing to serve {cfg.mlflow_registered_model}@{target.alias}: its run "
+            f"({target.run_id}) was evaluated at decision_threshold={threshold}, but this "
+            f"process is configured for {cfg.decision_threshold}. The run's held-out "
+            "precision/recall/F1 — and the model card served at finrisk://model/card — "
+            f"describe the {threshold} operating point, so serving {cfg.decision_threshold} "
+            "would attach live decisions to metrics that never measured them. Either set "
+            f"FINRISK_DECISION_THRESHOLD={threshold} to serve what was evaluated, or re-run "
+            "`python -m ml_pipeline.eval` at the new threshold to re-measure this version "
+            "against it."
+        )
+    return threshold
 
 
 def build_model_bundle(cfg: MLConfig, target: RegisteredModel) -> ModelBundle:
@@ -89,13 +140,15 @@ def build_model_bundle(cfg: MLConfig, target: RegisteredModel) -> ModelBundle:
         model_type=cfg.model_type,
         background=background,
     )
+    decision_threshold = _resolve_decision_threshold(cfg, target)
     logger.info(
-        "Loaded model bundle: %d features, %s v%s (@%s, run %s)",
+        "Loaded model bundle: %d features, %s v%s (@%s, run %s), deciding at threshold %s",
         len(feature_names),
         cfg.mlflow_registered_model,
         target.version,
         target.alias,
         target.run_id,
+        decision_threshold,
     )
     return ModelBundle(
         model=target.model,
@@ -105,6 +158,7 @@ def build_model_bundle(cfg: MLConfig, target: RegisteredModel) -> ModelBundle:
         model_version=target.display_version,
         run_id=target.run_id,
         artifacts_dir=target.artifacts_dir,
+        decision_threshold=decision_threshold,
     )
 
 
@@ -167,7 +221,11 @@ class ScoringService:
         return float(proba[0])
 
     def _to_score_result(self, client_id: str, probability_default: float) -> CreditScoreResult:
-        threshold = self._cfg.decision_threshold
+        # The served run's threshold, not this process's config. Startup
+        # already refused to continue if the two disagreed, so this is the
+        # same number — sourcing it here is what makes the decision policy
+        # a property of the model version rather than of the environment.
+        threshold = self._bundle.decision_threshold
         if probability_default < threshold * 0.5:
             recommendation = "APPROVE"
         elif probability_default < threshold:
@@ -272,6 +330,11 @@ class ScoringService:
             "alias": self._cfg.mlflow_model_alias,
             "model_version": self._bundle.model_version,
             "run_id": self._bundle.run_id,
+            # Stated explicitly: it is the operating point every
+            # `recommendation` in this server's answers was produced at, and
+            # the one the metrics below were measured at — startup enforces
+            # that those are the same number.
+            "decision_threshold": self._bundle.decision_threshold,
             "metadata": _read(METADATA_ARTIFACT),
             "metrics": _read(METRICS_ARTIFACT),
         }

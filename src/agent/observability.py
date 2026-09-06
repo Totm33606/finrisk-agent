@@ -1,9 +1,29 @@
 """Langfuse observability for the FinRisk agent.
 
 Centralizes everything Langfuse-related so `agent.py` stays focused on
-orchestration logic. Every agent run is traced end-to-end: the top-level
-LLM calls, every MCP tool invocation (name, input, output, latency), and
-token cost, all rolled up under one Langfuse trace per analyst request.
+orchestration logic. One Langfuse trace is opened per analyst request, and
+everything LangChain reports during that run is attached to it.
+
+Scope, stated precisely — this is LLMOps, not yet AgentOps:
+
+* **Traced well.** LLM calls arrive as typed `GENERATION` observations with
+  prompt, completion, token counts, cost and latency.
+* **Traced weakly.** MCP tool calls do reach Langfuse — the v2 handler
+  implements `on_tool_start`/`on_tool_end`/`on_tool_error`, and the adapter's
+  tools are ordinary `StructuredTool`s, so those callbacks fire. But v2 has
+  no *tool* observation type: each one lands as a generic span carrying a raw
+  input/output string, indistinguishable in the UI from LangGraph's own
+  internal node spans, and with no domain fields on it (PD, risk band, served
+  model version).
+* **Not traced.** The run's outcome. Nothing calls `trace.update(output=...)`
+  or `score()`, so the final APPROVE/REVIEW/DECLINE, the PD behind it and
+  whether the agent agreed with the model's own recommendation never reach
+  the trace — which is exactly what a credit-decision audit would query on.
+* **Out of scope entirely.** The MCP scoring server is a separate process and
+  is not instrumented; it emits application logs only.
+
+Closing the last two is what would make this an audit trail rather than a
+log. `agent.py` reads back only the trace id, for cross-linking from the UI.
 """
 
 from __future__ import annotations

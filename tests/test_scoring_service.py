@@ -15,6 +15,7 @@ import lightgbm as lgb
 import pandas as pd
 import pytest
 from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
 from sklearn.linear_model import LogisticRegression
 
 from common.schemas import ScenarioParams
@@ -72,6 +73,10 @@ def scoring_service(tmp_cfg: MLConfig, tmp_path: Path) -> ScoringService:
         model_version="test",
         run_id="0" * 32,
         artifacts_dir=tmp_path / "artifacts",
+        # Normally read off the served run's tag; stated here because this
+        # bundle bypasses the registry, and the decision policy has to come
+        # from the bundle rather than from ambient config.
+        decision_threshold=tmp_cfg.decision_threshold,
     )
     store = ClientStore(tmp_cfg.raw_data_path, id_column=tmp_cfg.id_column)
     return ScoringService(bundle=bundle, store=store, cfg=tmp_cfg)
@@ -168,6 +173,70 @@ def test_build_default_scoring_service_serves_the_registry_champion(tmp_path: Pa
     assert 0.0 <= score.probability_default <= 1.0
     assert score.model_version == service._bundle.model_version
     assert len(service.get_shap_explanation(holdout_id).contributions) > 0
+
+
+def _threshold_cfg(tmp_path: Path, experiment: str, threshold: float) -> MLConfig:
+    """A serving config differing from another only in its decision threshold.
+
+    `decision_threshold` is passed explicitly rather than left to the default
+    so a developer's own `.env` can't decide what these tests assert.
+    """
+    return MLConfig(
+        model_type="logistic_regression",
+        data_dir=tmp_path,
+        raw_data_path=tmp_path / "clients.parquet",
+        mlflow_dir=tmp_path / "mlruns",
+        mlflow_experiment=experiment,
+        decision_threshold=threshold,
+    )
+
+
+def test_served_threshold_comes_from_the_run_not_the_process_config(tmp_path: Path) -> None:
+    """The decision policy travels with the model version, like the preprocessor.
+
+    Every score, and the model card, must state the threshold recorded on
+    the run being served — otherwise the card advertises a precision/recall
+    pair measured at one operating point next to decisions taken at another.
+    """
+    cfg = _threshold_cfg(tmp_path, "test-threshold-source", 0.42)
+    _publish_champion(cfg, tmp_path)
+
+    service = build_default_scoring_service(cfg)
+
+    assert service._bundle.decision_threshold == 0.42
+    holdout_id = str(
+        pd.read_parquet(tmp_path / "staging" / tracking.HOLDOUT_ARTIFACT)["client_id"].iloc[0]
+    )
+    assert service.get_credit_score(holdout_id).decision_threshold == 0.42
+    assert service.get_model_card()["decision_threshold"] == 0.42
+
+
+def test_serving_refuses_a_threshold_the_run_was_never_evaluated_at(tmp_path: Path) -> None:
+    """The skew this guard exists for: publish at 0.30, then serve at 0.45.
+
+    Fatal at startup, not silent per request — the model card would
+    otherwise keep reporting metrics measured at 0.30 beside live
+    APPROVE/REVIEW/DECLINE calls taken at 0.45.
+    """
+    published = _threshold_cfg(tmp_path, "test-threshold-skew", 0.30)
+    _publish_champion(published, tmp_path)
+
+    retuned = _threshold_cfg(tmp_path, "test-threshold-skew", 0.45)
+
+    with pytest.raises(RuntimeError, match=r"was evaluated at decision_threshold=0\.3, but"):
+        build_default_scoring_service(retuned)
+
+
+def test_serving_reports_a_run_missing_its_threshold_tag_actionably(tmp_path: Path) -> None:
+    """A run predating the tag is an incomplete run, not a default to guess at."""
+    cfg = _threshold_cfg(tmp_path, "test-threshold-missing", 0.30)
+    run_id = _publish_champion(cfg, tmp_path)
+    MlflowClient(tracking_uri=cfg.mlflow_tracking_uri).delete_tag(
+        run_id, tracking.DECISION_THRESHOLD_TAG
+    )
+
+    with pytest.raises(KeyError, match="re-run"):
+        build_default_scoring_service(cfg)
 
 
 def test_serving_never_writes_to_the_mlflow_store(tmp_path: Path) -> None:
@@ -309,7 +378,7 @@ def test_client_store_raises_when_data_file_missing(tmp_path: Path) -> None:
 
 
 def test_to_score_result_recommendation_bands(scoring_service: ScoringService) -> None:
-    threshold = scoring_service._cfg.decision_threshold
+    threshold = scoring_service._bundle.decision_threshold
 
     approve = scoring_service._to_score_result("SME-A", threshold * 0.1)
     review = scoring_service._to_score_result("SME-B", threshold * 0.75)

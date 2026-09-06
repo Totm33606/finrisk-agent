@@ -11,7 +11,13 @@ const TOOL_LABELS = {
  * each MCP tool call "prints" a line with a sequence number, a monospace
  * timestamp-style tag, its inputs, and a condensed result. This is the
  * literal "chain of thought" surface: what the agent asked the MCP server,
- * in the order it asked it, updated live as steps arrive.
+ * in the order it asked it.
+ *
+ * Despite the teletype styling, steps are NOT streamed: `/analyze` returns
+ * the whole trajectory in one response, so `steps` goes from empty to
+ * complete in a single render. `isRunning` drives the spinner that stands
+ * in for the missing intermediate states. Wiring this up to a real event
+ * stream is an agent-side change (per-tool events), not a change here.
  */
 export default function AgentTrace({ steps, isRunning }) {
   return (
@@ -25,7 +31,7 @@ export default function AgentTrace({ steps, isRunning }) {
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3 ledger-bg">
         {steps.length === 0 && !isRunning && (
           <p className="font-body text-sm text-paper-500">
-            No tool calls yet — ask a question to watch the agent consult the MCP server live.
+            No tool calls yet — ask a question to see which tools the agent consulted.
           </p>
         )}
 
@@ -33,10 +39,12 @@ export default function AgentTrace({ steps, isRunning }) {
           <TraceLine key={step.step_index} step={step} />
         ))}
 
+        {/* Not "awaiting the next tool call": the response is atomic, so during
+            a run there are no steps yet and the whole trajectory lands at once. */}
         {isRunning && (
           <div className="flex items-center gap-2 font-mono text-xs text-paper-500 animate-print-in">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            awaiting next tool call…
+            consulting the MCP server…
           </div>
         )}
       </div>
