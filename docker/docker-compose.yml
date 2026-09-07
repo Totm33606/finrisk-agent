@@ -75,6 +75,18 @@ services:
       # A TCP connect, not an HTTP request: FastMCP serves only the MCP
       # protocol on /mcp, with no health route to call. This proves the
       # listener is up — the agent's own handshake proves the rest.
+      #
+      # `socket.create_connection` against 127.0.0.1, not a hostname: it
+      # resolves the target and tries every returned address in order until
+      # one connects, so it would ride out an IPv6-first resolution the same
+      # way `urlopen` does for `agent-api`'s inherited HEALTHCHECK (declared
+      # in Dockerfile.backend — see its own comment below for why that one
+      # is fine hitting `localhost`) — but there is no hostname lookup to
+      # get wrong in the first place here, and no reason to introduce one.
+      # `mlflow-ui`'s healthcheck mirrors this exactly, for the same reason.
+      # Contrast `langfuse`'s healthcheck further down: BusyBox `wget` has
+      # no such fallback, which is what made it fail there until pinned to
+      # 127.0.0.1 too.
       test:
         - CMD
         - python
@@ -101,10 +113,109 @@ services:
     volumes:
       - ../mlruns:/app/mlruns:ro
     # The image's own HEALTHCHECK probes the agent API on :8080 (its default
-    # CMD). This service serves MLflow on :5000, so inheriting it would just
-    # report a permanently unhealthy container.
+    # CMD) — the wrong port for this service, which serves on :5000 instead,
+    # so inheriting it would report a permanently unhealthy container.
+    # Replaced, not just disabled: nothing else in this stack waits on
+    # `mlflow-ui`, but a service with no active check at all is the odd one
+    # out next to `mcp`/`langfuse`/`langfuse-db`, and `docker ps` should say
+    # something truthful rather than never report health either way. Same
+    # TCP-connect idiom as `mcp` (see its healthcheck comment), on this
+    # service's own port.
     healthcheck:
-      disable: true
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; socket.create_connection(("127.0.0.1", 5000), 3).close()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Self-hosted Langfuse, so the agent's traces have somewhere to go without a
+  # cloud account. Pinned to the v2 line on purpose: `pyproject.toml` pins the
+  # client to `langfuse>=2.53.9,<3.0.0`, and v3 is a different ingestion
+  # backend (ClickHouse + Redis) that the v2 client does not speak.
+  #
+  # Two-step by nature, and there is no way around it: Langfuse issues project
+  # API keys through its own UI, so bringing this up does NOT switch tracing on
+  # by itself. Open http://localhost:3000, create an account and a project,
+  # copy the public/secret keys into `.env`, then restart `agent-api`. Until
+  # then the agent logs "Langfuse credentials not set" and runs untraced —
+  # which is a supported mode, not a failure.
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: finrisk-langfuse
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      # Next.js standalone server binds to `process.env.HOSTNAME`, which
+      # Docker sets to the container's own short id by default — the
+      # container's embedded DNS then resolves that to its actual bridge-
+      # network IP (e.g. 172.18.0.5), not to loopback. The app is then only
+      # reachable via that IP: fine for the host (port-published) and for
+      # other services (via the `langfuse` service name, which resolves to
+      # the same IP), but the healthcheck below runs *inside* this
+      # container and hits `localhost`, where nothing is listening — hence
+      # "unhealthy" despite the app answering everyone else. Forcing the
+      # bind address to all interfaces fixes the self-check without
+      # affecting how anyone outside the container reaches it.
+      - HOSTNAME=0.0.0.0
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      # Browser-facing URL, so it is the host's, not the compose network's.
+      - NEXTAUTH_URL=http://localhost:3000
+      # Dev-only defaults: these sign sessions and encrypt stored secrets, so
+      # any real deployment must replace all three. ENCRYPTION_KEY has to be
+      # exactly 64 hex characters — generate one with
+      # `openssl rand -hex 32`.
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:-finrisk-dev-nextauth-secret}
+      - SALT=${LANGFUSE_SALT:-finrisk-dev-salt}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      - TELEMETRY_ENABLED=${LANGFUSE_TELEMETRY_ENABLED:-false}
+    healthcheck:
+      # 127.0.0.1, not localhost: this Alpine-based image resolves
+      # "localhost" to ::1 first, and Next.js only binds the IPv4 wildcard
+      # (HOSTNAME=0.0.0.0 above) — nothing listens on IPv6, so BusyBox
+      # wget's first (and only) attempt against ::1 refuses the connection.
+      # Reproduced directly: `wget http://[::1]:3000/...` fails inside this
+      # container while `wget http://127.0.0.1:3000/...` succeeds.
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --spider
+        - http://127.0.0.1:3000/api/public/health
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: finrisk-langfuse-db
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+    # Not published to the host: only `langfuse` needs to reach it, and this
+    # database holds traces, not anything the rest of the stack reads.
+    volumes:
+      - langfuse-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      # Tighter interval than the other checks in this file: `langfuse`
+      # gates its own startup on this one (`condition: service_healthy`
+      # below), and transitively so does `agent-api` on `langfuse` — so this
+      # is the one healthcheck on the critical path to the stack coming up,
+      # not just a liveness signal for its own sake.
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   agent-api:
     build:
@@ -117,6 +228,11 @@ services:
     depends_on:
       mcp:
         condition: service_healthy
+      # `service_started`, not `service_healthy`: tracing is optional, so the
+      # agent must not be held back — or taken down — by Langfuse. Events
+      # queue on a background worker and the run itself never blocks on it.
+      langfuse:
+        condition: service_started
     # Makes host.docker.internal resolve on Linux Docker Engine too (Docker
     # Desktop already provides it for free on Mac/Windows) — needed for
     # LOCAL_LLM_BASE_URL below to reach an Ollama/LM Studio running on the host.
@@ -126,13 +242,28 @@ services:
       - FINRISK_MCP_URL=${FINRISK_MCP_URL:-http://mcp:8000/mcp}
       # host.docker.internal, not localhost: this is the container's own
       # network namespace, so `localhost` would mean the container itself.
-      # Wires the local-Ollama/LM Studio path only — using Azure OpenAI,
-      # plain OpenAI or Langfuse through this stack means adding the
-      # corresponding vars here too (kept out for now, see .env.example).
+      # Wires the local-Ollama/LM Studio path only — using Azure OpenAI or
+      # plain OpenAI through this stack means adding those vars here too
+      # (see .env.example).
       - LOCAL_LLM_BASE_URL=${LOCAL_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
-    # No healthcheck block: this service runs the image's default CMD, so the
-    # image's own HEALTHCHECK (same probe) already applies and `dashboard`'s
-    # `service_healthy` below waits on it.
+      # Empty by default, which is what keeps tracing off until you have
+      # created a project in the Langfuse UI and put its keys in `.env`.
+      # `observability.py` treats absent keys as "run untraced", so nothing
+      # here fails when they are missing.
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      # The compose service name, not localhost:3000 — that is the browser's
+      # address for Langfuse, and this container has its own loopback.
+      - LANGFUSE_HOST=${LANGFUSE_DOCKER_HOST:-http://langfuse:3000}
+      - FINRISK_ANALYST_ID=${FINRISK_ANALYST_ID:-analyst@finrisk.local}
+    # No healthcheck block: this service runs the image's default CMD, so
+    # the image's own HEALTHCHECK (Dockerfile.backend) already applies and
+    # `dashboard`'s `service_healthy` below waits on it. That check hits
+    # `http://localhost:8080/health` — a hostname, like the one that broke
+    # `langfuse`'s healthcheck below — but stays safe for the same reason
+    # `mcp`'s check does (see its comment): `urlopen`/`socket.create_connection`
+    # try every resolved address in turn, so an IPv6-first `localhost`
+    # doesn't strand it the way BusyBox `wget` gets stranded.
 
   dashboard:
     build:
@@ -150,3 +281,26 @@ services:
     depends_on:
       agent-api:
         condition: service_healthy
+    # Nothing depends_on `dashboard` — it's the last node in the graph, so
+    # this check gates nothing. Added anyway so it isn't the one service in
+    # this file with no health signal at all; same 127.0.0.1-over-hostname
+    # idiom as every other check here, even though this particular nginx
+    # image happens to also work fine against `localhost`.
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --spider
+        - http://127.0.0.1:80/
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# Named volume rather than a bind mount under ../: traces are Langfuse's own
+# state, not a project artifact like mlruns/, and nothing in this repo reads
+# them. `docker compose down -v` is what discards them.
+volumes:
+  langfuse-db-data:

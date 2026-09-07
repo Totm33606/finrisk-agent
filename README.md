@@ -106,9 +106,9 @@ already familiar with them.
   (ask → call a tool → read the result → decide the next step, a pattern
   called *ReAct*).
 - **Langfuse**: a dashboard for reviewing past AI runs — which tools were
-  called, with what inputs/outputs, how long each step took and what the
-  tokens cost. (What this repo wires up today is the LLM-call side of that;
-  [Agent & observability](#agent--observability) is precise about the rest.)
+  called, how long each step took, what the tokens cost, and what the agent
+  concluded. [Agent & observability](#agent--observability) is precise about
+  which of those signals this repo records and which it doesn't.
 - **MLflow**: the same idea, but for the *statistical model* rather than the
   AI agent — it keeps a numbered history of every training run (settings
   used, accuracy obtained, charts produced) and a registry that records
@@ -122,7 +122,7 @@ flowchart TD
     API["🤖 FastAPI Agent Layer<br/>LangGraph ReAct agent<br/>(agent/agent.py)"]
     MCP["🔌 FastMCP Server<br/>get_credit_score · get_shap_explanation<br/>simulate_financial_scenario<br/>(mcp_server/server.py)"]
     ML["📊 Core ML Pipeline<br/>preprocessing · LightGBM · SHAP<br/>(ml_pipeline/*)"]
-    LF["📝 Langfuse<br/>agent-side trace: LLM calls, cost,<br/>tool calls as generic spans"]
+    LF["📝 Langfuse<br/>agent-side trace: LLM calls, cost,<br/>decision, tool telemetry, scores"]
     MLF["📈 MLflow<br/>runs, metrics, artifacts<br/>@champion model registry"]
 
     UI -->|"REST /analyze"| API
@@ -195,7 +195,7 @@ finrisk-agent/
 │   │   └── server.py          # the 3 tools + 1 resource exposed to the agent
 │   └── agent/
 │       ├── agent.py           # the AI agent + its web API (MCP over HTTP or stdio)
-│       └── observability.py   # Langfuse setup (LLM calls; see its docstring for scope)
+│       └── observability.py   # Langfuse trace, tool telemetry, run scores
 ├── frontend/                  # Vite + React + Tailwind dashboard
 │   └── src/
 │       ├── App.jsx
@@ -242,11 +242,32 @@ native Windows where `make` isn't available out of the box.
 ### Option B — Docker Compose
 
 ```bash
-cp .env.example .env
+cp .env.example docker/.env                   # note the path — see below
 uv run python -m ml_pipeline.make_dataset     # required: populates data/
 make docker-train                             # required: populates mlruns/
 docker compose -f docker/docker-compose.yml up --build
 ```
+
+**`docker/.env`, not `.env` — this trips people up.** Compose resolves the
+`${VAR}` substitutions in `docker-compose.yml` against a `.env` file in its
+*project directory*, which defaults to the directory holding the compose
+file (`docker/`), **not** the repo root and not your shell's working
+directory. A `.env` at the repo root is silently ignored by every
+`docker compose` command here — variables resolve to their compose defaults
+and nothing warns you. (This is unrelated to `build.context: ..`, which only
+governs what the *image build* can `COPY`.) Verify what actually landed in a
+container with:
+
+```bash
+docker compose -f docker/docker-compose.yml exec agent-api env | grep LANGFUSE
+```
+
+The two files are deliberately separate rather than symlinked: local runs and
+containers need *different* values for the same names. `LANGFUSE_HOST` is
+`http://langfuse:3000` inside the compose network but `http://localhost:3000`
+from your browser, and `LOCAL_LLM_BASE_URL` is `localhost:11434` locally but
+`host.docker.internal:11434` from a container. `docker-compose.yml` supplies
+the container-side defaults, so `docker/.env` only needs the secrets.
 
 **Why training runs in a container, not on the host.** MLflow's file store
 bakes the absolute path in effect at run creation into that run's artifact
@@ -257,11 +278,12 @@ that same path, so every writer and reader agrees on where it lives — and
 `mlflow-ui` browses it from that same context, whereas `mlflow ui` on the
 host lists runs fine but 500s on opening any Docker-trained artifact.
 
-Four services come up: the **MCP scoring server**, the **agent API**
-(`:8080`), the **dashboard** (`:5173`) and an **MLflow UI** (`:5000`) to
-browse the store. The agent reaches the scoring server over HTTP on the
-compose network (`FINRISK_MCP_URL`) and waits for it to pass its healthcheck
-first, so the split is real — not a subprocess in disguise.
+Six services come up: the **MCP scoring server**, the **agent API**
+(`:8080`), the **dashboard** (`:5173`), an **MLflow UI** (`:5000`) to browse
+the store, and a self-hosted **Langfuse** (`:3000`) with its own Postgres.
+The agent reaches the scoring server over HTTP on the compose network
+(`FINRISK_MCP_URL`) and waits for it to pass its healthcheck first, so the
+split is real — not a subprocess in disguise.
 
 | Service | Port | Mounts | Sees the model store |
 |---|---|---|---|
@@ -269,6 +291,25 @@ first, so the split is real — not a subprocess in disguise.
 | `agent-api` | 8080 | none | no |
 | `dashboard` | 5173 | none | no |
 | `mlflow-ui` | 5000 | `mlruns/` read-only | yes |
+| `langfuse` | 3000 | none | no |
+| `langfuse-db` | internal only | named volume | no |
+
+**Langfuse needs one manual step.** It issues project API keys through its
+own UI, so bringing the stack up does not switch tracing on: open
+<http://localhost:3000>, create an account and a project, put its keys in
+`docker/.env` as `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`, then
+**recreate** the container:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d --force-recreate agent-api
+```
+
+`--force-recreate`, because environment variables are fixed when a container
+is created — `docker restart` re-runs the process with the *old* environment
+and looks like the keys were ignored. Until the keys are set the agent runs
+untraced, which is a supported mode. Compose points the container at
+`http://langfuse:3000` — `localhost:3000` is the *browser's* address for it,
+not the agent container's.
 
 At serving time `mlruns/` is the **only** mount in the stack, and read-only:
 serving returns data, never files, so no long-running container needs a
@@ -567,23 +608,37 @@ as long as the model you run supports tool calling (e.g.
 optional: the agent still works fine locally without Langfuse configured,
 it just won't be recorded.
 
-**What Langfuse currently captures — and what it doesn't.** Tracing here is
-still LLMOps rather than AgentOps, and the gap is worth stating plainly
-before you rely on a trace for an audit:
+**What Langfuse captures — and what it doesn't.**
 
 | | Status |
 |---|---|
 | LLM calls (prompt, completion, tokens, cost, latency) | ✅ Typed `GENERATION` observations |
-| Tool calls (name, input, output, latency, errors) | ⚠️ Emitted, but as *generic* spans — Langfuse v2 has no tool observation type, so an MCP call is visually indistinguishable from LangGraph's own internal node spans, and carries no domain fields (PD, risk band, model version) |
-| The agent's final decision on the trace | ❌ Never written — `trace.update(output=...)` is not called, so you cannot query "show me every DECLINE" |
-| Quality scores (grounded in tools? decision consistent with the model's own recommendation?) | ❌ No `score()` calls |
-| MCP server-side spans | ❌ The scoring server writes application logs only; nothing reaches Langfuse from that process |
-| Session / user grouping | ⚠️ Both fields are set, but `session_id` is a fresh UUID per request and `user_id` is a hardcoded constant, so neither dimension groups anything yet |
+| The agent's decision, on the trace | ✅ Trace output, plus a `decision:DECLINE` tag — so "show me every DECLINE last quarter" is one filter |
+| Model-side facts behind it | ✅ PD, risk band, served model version and decision threshold in trace metadata, so an audit needn't parse a span's raw output |
+| Tool calls (name, latency, success/failure) | ✅ Counted, timed and summarized onto the trace by `ToolTelemetry`, and logged in-process regardless of Langfuse |
+| Quality scores | ✅ `grounded_in_tools`, `decision_matches_model`, `tool_success_rate` — objective, no LLM judge |
+| Tool calls as first-class *spans* | ⚠️ Emitted by the LangChain integration, but Langfuse v2 has no tool observation type, so each is a generic span not visually distinct from LangGraph's internal node spans. This is why the telemetry above is collected separately |
+| MCP server-side spans | ❌ The scoring server is a separate process, emits application logs only, and is not instrumented — tool latency is therefore measured from the agent's side |
 
-The trace metadata that *is* set (session, user, client id, release, tags)
-comes from [`observability.py`](src/agent/observability.py), which is also
-where the remaining rows would be closed — see
-[Design decisions & trade-offs](#design-decisions--trade-offs).
+`decision_matches_model` is the one worth watching: the system prompt lets
+the agent diverge from the model's own recommendation *with a stated
+reason*, so a 0 there is not a failure — it is the flag telling a reviewer
+which narratives actually need reading.
+
+Tracing is optional throughout. With no keys set the agent runs untraced,
+and the tool telemetry still reaches the application log — see
+[`observability.py`](src/agent/observability.py), whose docstring is precise
+about what goes where.
+
+**Running Langfuse locally.** `make docker-up` brings up a self-hosted
+`langfuse` service (v2, matching the pinned client) with its own Postgres.
+It is deliberately not wired up for you, because Langfuse issues project API
+keys through its own UI: open <http://localhost:3000>, create an account and
+a project, copy the keys into `docker/.env` (that path matters — see
+[Option B](#option-b--docker-compose)), then recreate `agent-api` with
+`--force-recreate`. Until you do, the stack runs and the agent traces
+nothing. Keys, projects and traces live in the `langfuse-db-data` volume, so
+they survive `docker compose down` and only a `down -v` discards them.
 
 ## Dashboard
 
@@ -717,7 +772,7 @@ Each major dependency was picked over a real alternative, not by default:
 | Model↔agent boundary | MCP (via FastMCP) | Keeps the scoring model fully independent of whichever AI agent or provider uses it — swap the agent framework later, and the model side is untouched. The alternative (wiring functions straight into one agent framework) would lock the two together. |
 | Agent orchestration | LangGraph | A ready-made, tested "ask → call a tool → read result → repeat" loop, instead of hand-writing that control flow (more code, more places for bugs). |
 | Artifact store, tracking & registry | MLflow (`./mlruns` file store) | The default choice for versioning training runs and promoting a model to production, and the one that keeps the model side symmetrical with the Langfuse-traced agent side. Used as the *only* artifact store rather than as a log alongside local files — one source of truth can't disagree with itself, at the cost of making it a hard dependency of serving. Kept on the plain file store rather than a `sqlite:///` backend: MLflow 2.x's file store implements the whole registry surface used here (register, aliases, `models:/name@alias` loading), so a database would add a migration and a split artifact root for nothing. |
-| Observability | Langfuse | Purpose-built for recording what an AI agent did — tool calls, inputs/outputs, cost — which is exactly the audit trail a finance use case needs. What is wired up today is the LLM-call half of that; see [Agent & observability](#agent--observability) for the honest per-signal breakdown. It's optional: the agent still runs without it. |
+| Observability | Langfuse | Purpose-built for recording what an AI agent did — tool calls, inputs/outputs, cost — which is exactly the audit trail a finance use case needs. Each run's trace carries the decision, the model-side facts behind it and three quality scores, so the trace answers audit questions rather than just replaying steps; see [Agent & observability](#agent--observability) for the per-signal breakdown, including what is still missing. Self-hostable (a `langfuse` service ships in the compose stack) and optional: the agent still runs untraced without keys. |
 | Configuration | pydantic-settings | One typed, validated settings file shared by every script, so they can't silently drift out of sync with each other. |
 | CLIs | typer | Turns ordinary Python functions into command-line tools with almost no extra code. |
 | Packaging & running | uv | One fast tool for creating environments, installing dependencies, and running scripts — replacing the usual pip + venv combo, and working the same way on Windows, macOS, and Linux. |

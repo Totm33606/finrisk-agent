@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
 from agent.agent import FinRiskAgentRuntime, _build_llm
+from agent.observability import ToolTelemetry
 from common.schemas import CreditDecision
 
 
@@ -70,6 +71,22 @@ async def test_analyze_parses_tool_steps_and_decision(
     assert result.steps[0].raw_output == {"probability_default": 0.12, "risk_band": "LOW"}
     assert "12" in result.steps[0].tool_output_summary
     stubbed_runtime._graph.ainvoke.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_analyze_wires_tool_telemetry_into_the_graph_config(
+    stubbed_runtime: FinRiskAgentRuntime,
+) -> None:
+    """Tool telemetry is passed on every run, Langfuse configured or not.
+
+    It is what makes tool successes/failures observable from the agent
+    process itself, rather than depending on spans the Langfuse integration
+    drops silently when it cannot place them under a parent.
+    """
+    await stubbed_runtime.analyze("SME-1", "Should we approve this client?")
+
+    config = stubbed_runtime._graph.ainvoke.await_args.kwargs["config"]
+    assert any(isinstance(handler, ToolTelemetry) for handler in config["callbacks"])
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Must run before `agent.observability` is imported: `ObservabilityConfig` reads
 # LANGFUSE_* via `os.getenv(...)` at class-definition time (import time), and
@@ -47,11 +47,16 @@ from pydantic import BaseModel
 # own fields) puts .env values into the real process environment — only this does.
 load_dotenv()
 
-from agent.observability import build_callback_handler, flush, get_langfuse_client  # noqa: E402
+from agent.observability import flush, start_run_trace  # noqa: E402
 from common.schemas import AgentAnalysisResult, AgentStep, CreditDecision  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Who the trace is attributed to in Langfuse's "Users" view. Configurable
+# rather than hardcoded so a deployment can name its actual analyst instead
+# of leaving every run in the project pointing at one placeholder identity.
+DEFAULT_ANALYST_ID = os.getenv("FINRISK_ANALYST_ID", "analyst@finrisk.local")
 
 SYSTEM_PROMPT = """\
 You are a senior credit risk analyst assistant for FinRisk-Agent.
@@ -173,17 +178,31 @@ class FinRiskAgentRuntime:
         self._graph = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
 
     async def analyze(
-        self, client_id: str, question: str, *, user_id: str = "analyst@finrisk.local"
+        self,
+        client_id: str,
+        question: str,
+        *,
+        user_id: str = DEFAULT_ANALYST_ID,
+        session_id: str | None = None,
     ) -> AgentAnalysisResult:
-        """Run the agent for one (client_id, question) pair and return a structured result."""
+        """Run the agent for one (client_id, question) pair and return a structured result.
+
+        `session_id` groups several requests into one Langfuse session — pass
+        the same value for follow-up questions about a client to review them
+        as one conversation. A fresh id per call (the default) makes every
+        run its own session, which is correct but tells you nothing.
+        """
         if self._graph is None:
             raise RuntimeError("Agent not started — call `await runtime.start()` first.")
 
-        session_id = str(uuid.uuid4())
-        handler = build_callback_handler(
-            session_id=session_id, user_id=user_id, client_id=client_id, question=question
+        run_trace = start_run_trace(
+            session_id=session_id or str(uuid.uuid4()),
+            user_id=user_id,
+            client_id=client_id,
+            question=question,
         )
-        config = {"callbacks": [handler]} if handler else {}
+        # Always non-empty: tool telemetry runs even with Langfuse switched off.
+        config: dict[str, Any] = {"callbacks": run_trace.callbacks}
 
         # No SystemMessage here: `create_react_agent(..., prompt=SYSTEM_PROMPT)`
         # already prepends it to every invocation, and sending it twice just
@@ -198,10 +217,7 @@ class FinRiskAgentRuntime:
         final_message = result_state["messages"][-1]
         synthesis = self._parse_final_message(final_message, client_id=client_id)
 
-        langfuse_client = get_langfuse_client()
-        trace_id = getattr(handler, "trace_id", None) if langfuse_client else None
-
-        return AgentAnalysisResult(
+        result = AgentAnalysisResult(
             client_id=client_id,
             question=question,
             decision=synthesis.decision,
@@ -209,8 +225,12 @@ class FinRiskAgentRuntime:
             key_drivers=synthesis.key_drivers,
             steps=steps,
             total_latency_ms=total_latency_ms,
-            langfuse_trace_id=trace_id,
+            langfuse_trace_id=run_trace.trace_id,
         )
+        # After the result exists, because the decision is what the trace was
+        # missing: it records the outcome, tags it, and scores the run.
+        run_trace.finish(result)
+        return result
 
     @staticmethod
     def _extract_steps(messages: list[Any]) -> list[AgentStep]:
@@ -340,6 +360,13 @@ api.add_middleware(
 class AnalyzeRequest(BaseModel):
     client_id: str
     question: str = "Should we approve this client's credit request?"
+    session_id: str | None = Field(
+        None,
+        description=(
+            "Optional. Reuse the same value across follow-up questions to group them "
+            "into one Langfuse session; omit it and each request gets its own."
+        ),
+    )
 
 
 @api.post("/analyze", response_model=AgentAnalysisResult)
@@ -352,7 +379,9 @@ async def analyze(payload: AnalyzeRequest) -> AgentAnalysisResult:
     after the fact, not as they happen.
     """
     try:
-        return await runtime.analyze(payload.client_id, payload.question)
+        return await runtime.analyze(
+            payload.client_id, payload.question, session_id=payload.session_id
+        )
     except Exception as exc:
         # Full detail goes to the server log only — the client gets a generic
         # message so internal error text (file paths, provider error bodies,

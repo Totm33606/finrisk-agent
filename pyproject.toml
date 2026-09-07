@@ -94,7 +94,7 @@ module = [
     "shap",
     "sklearn.*",
     "langfuse",
-    "langfuse.callback",
+    "langfuse.client",
     "langchain_mcp_adapters.*",
 ]
 ignore_missing_imports = true
